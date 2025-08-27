@@ -9,8 +9,8 @@ from typing import Dict, Any, List
 
 # Minimal brand theme
 BRAND = {
-    "font_family_head": "GT America Extended Regular",
-    "font_family_body": "GT America Regular",
+    "font_family_head": "Arial",  # Fallback to common fonts
+    "font_family_body": "Arial",
     "title_size": 28,
     "axis_size": 11,
     "label_size": 12,
@@ -29,7 +29,8 @@ def _apply_background(slide):
     fill.solid()
     fill.fore_color.rgb = BRAND["bg_color"]
 
-def add_title(slide, text):
+def add_title(slide, text, table_title=None):
+    """Add a title to the slide with optional alt text for mapping."""
     tx = slide.shapes.title if slide.shapes.title else slide.shapes.add_textbox(Inches(0.5), Inches(0.2), Inches(9), Inches(0.6))
     tf = tx.text_frame
     tf.clear()
@@ -39,6 +40,29 @@ def add_title(slide, text):
     run.font.size = Pt(BRAND["title_size"])
     run.font.bold = True
     run.font.name = BRAND["font_family_head"]
+    
+    # Add alt text for mapping if table_title is provided
+    if table_title:
+        _tag_shape(tx, "text_title", table_title, "Total")
+
+def add_question_text(slide, question_text, table_title, position=(0.5, 1.0, 9.0, 0.4)):
+    """Add question text with proper alt text for mapping."""
+    x, y, w, h = [Inches(pos) for pos in position]
+    qb = slide.shapes.add_textbox(x, y, w, h)
+    
+    # Set alt text for mapping using _tag_shape
+    _tag_shape(qb, "question_text", table_title, "Total")
+    
+    # Set the text content
+    tf = qb.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = f"Question: {question_text}"
+    run.font.size = Pt(12)
+    run.font.name = BRAND["font_family_body"]
+    
+    return qb
 
 def _chart_type_map(kind: str):
     kind = (kind or "").lower()
@@ -61,36 +85,104 @@ def _apply_series_colors(chart):
             fill.fore_color.rgb = rgb
 
 def _set_alt_text(shape, mapping: dict):
-    """Write simple key: value lines into Alt Text Description, easy for humans to edit."""
+    """Write simple key: value lines into Alt Text Description using the correct XML structure."""
     try:
-        lines = [f"{k}: {v}" for k, v in mapping.items()]
-        shape.alternative_text = "\n".join(lines)
+        # Create human-readable format that's easy to edit in PowerPoint
+        lines = []
+        for k, v in mapping.items():
+            if v is not None and v != "":
+                lines.append(f"{k}: {v}")
+        
+        alt_text_content = "\n".join(lines)
+        
+        # Method 1: Try to set via alternative_text property (if it exists)
+        try:
+            if hasattr(shape, 'alternative_text'):
+                shape.alternative_text = alt_text_content
+                return
+        except Exception:
+            pass
+        
+        # Method 2: Set via XML using the correct cNvPr structure
+        try:
+            if hasattr(shape, 'element'):
+                # Look for the cNvPr element which contains name and description
+                c_nv_pr = None
+                
+                # For GraphicFrame (charts/tables)
+                if 'graphicFrame' in shape.element.tag:
+                    c_nv_pr = shape.element.find('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
+                # For Shape (text boxes, etc.)
+                elif 'sp' in shape.element.tag:
+                    c_nv_pr = shape.element.find('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
+                
+                if c_nv_pr is not None:
+                    # Set the description attribute
+                    c_nv_pr.set('descr', alt_text_content)
+                    return
+                    
+        except Exception:
+            pass
+        
+        # Method 3: Try to set via shape name as a fallback
+        try:
+            # Use a special naming convention that includes the mapping info
+            safe_mapping = alt_text_content.replace('\n', ' | ').replace(':', '_')[:100]
+            shape.name = f"MAPPED_{safe_mapping}"
+        except Exception:
+            pass
+            
     except Exception:
         pass
 
 def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = None,
-               bind_question: str = "OBJ_QUESTION", bind_base: str = "OBJ_BASE"):
-    # Shape name pattern that the updater reads
+               bind_question: str = "TEXT_QUESTION", bind_base: str = "TEXT_BASE"):
+    """Tag shapes with alt text only - no shape naming."""
+    
     if obj_type == "chart":
-        shape.name = f"CHART:{table_title}:{col_key or 'Total'}"
         _set_alt_text(shape, {
-            "table_key": table_title,
-            "col": col_key or "Total",
-            "exclude": "base, mean, average, avg",
+            "type": "chart",
+            "table_title": table_title,
+            "column": col_key or "Total",
+            "exclude_rows": "base, mean, average, avg",
             "bind_question": bind_question,
             "bind_base": bind_base,
+            "auto_update": "yes"
         })
+        
     elif obj_type == "table":
-        shape.name = f"TABLE:{table_title}"
         _set_alt_text(shape, {
-            "table_key": table_title,
-            "col": "*",
-            "exclude": "base, mean, average, avg",
+            "type": "table", 
+            "table_title": table_title,
+            "columns": "*",
+            "column": col_key or "Total",  # Add column attribute
+            "exclude_rows": "base, mean, average, avg",
+            "auto_update": "yes"
         })
-    elif obj_type == "text_question":
-        shape.name = "OBJ_QUESTION"
+        
+    elif obj_type == "question_text":
+        _set_alt_text(shape, {
+            "type": "question_text",
+            "table_title": table_title,
+            "column": col_key or "Total",  # Add column attribute
+            "auto_update": "yes"
+        })
+        
     elif obj_type == "text_base":
-        shape.name = "OBJ_BASE"
+        _set_alt_text(shape, {
+            "type": "text_base",
+            "table_title": table_title,
+            "column": col_key or "Total",  # Add column attribute
+            "auto_update": "yes"
+        })
+        
+    elif obj_type == "text_title":
+        _set_alt_text(shape, {
+            "type": "text_title",
+            "table_title": table_title,
+            "column": col_key or "Total",  # Add column attribute
+            "auto_update": "yes"
+        })
 
 def _add_table(slide, col_labels: List[str], row_labels: List[str], values: List[List[float]]):
     rows = 1 + len(row_labels)
@@ -121,10 +213,20 @@ def _add_table(slide, col_labels: List[str], row_labels: List[str], values: List
 
     return table_shape
 
-def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None):
+def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None, question_text: str | None = None):
     slide = prs.slides.add_slide(prs.slide_layouts[layout])
     _apply_background(slide)
-    add_title(slide, chart_title or table["title"])
+    
+    # Add title with alt text for mapping
+    title_to_use = chart_title or table["title"]
+    add_title(slide, title_to_use, table.get("title"))
+    
+    # Add question text if provided
+    if question_text:
+        add_question_text(slide, question_text, table.get("title"), position=(0.5, 0.8, 9.0, 0.4))
+        chart_y_offset = 1.4  # Move chart down if question text is present
+    else:
+        chart_y_offset = 1.2  # Default chart position
 
     # Exclusions for charts
     base_row_idx = None
@@ -161,7 +263,7 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
         series_values = [0] * len(categories)
 
     # Add chart
-    x, y, w, h = Inches(0.5), Inches(1.2), Inches(9.0), Inches(3.0 if include_table else 6.0)
+    x, y, w, h = Inches(0.5), Inches(chart_y_offset), Inches(9.0), Inches(3.0 if include_table else 6.0)
     chart_type = _chart_type_map(chart_kind)
     chart_data = ChartData()
     chart_data.categories = categories
@@ -206,7 +308,11 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
 
     # Optional Base text
     if base_text:
-        tb = slide.shapes.add_textbox(Inches(0.5), Inches(7.0 if include_table else 7.0), Inches(9.0), Inches(0.4))
+        base_y = 7.0 if include_table else 7.0
+        if question_text:
+            base_y += 0.4  # Move base text down if question text is present
+            
+        tb = slide.shapes.add_textbox(Inches(0.5), Inches(base_y), Inches(9.0), Inches(0.4))
         _tag_shape(tb, "text_base", table.get("title"))
         tf = tb.text_frame
         tf.clear()
@@ -261,6 +367,7 @@ def export_pptx(tables: List[Dict[str, Any]], selections: Dict[str, Dict[str, An
             include_table=include_table,
             chart_title=title,
             base_text=sel.get("base_text"),
+            question_text=sel.get("question_text"),
         )
 
     prs.save(out_path)
