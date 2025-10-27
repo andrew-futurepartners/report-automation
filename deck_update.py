@@ -258,7 +258,7 @@ def _get_table_mapping_from_shape(shape, data: Dict[str, Any]) -> Optional[Dict[
     
     return None
 
-def _get_chart_mapping_from_shape(shape, data: Dict[str, Any]) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optional[Dict[str, Any]] = None) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
     """Enhanced chart mapping that handles both automatic and manual configurations."""
     name = shape.name or ""
     alt = _parse_alt_text(shape)
@@ -319,6 +319,12 @@ def _get_chart_mapping_from_shape(shape, data: Dict[str, Any]) -> Optional[Tuple
                 if _norm(t.get("title", "")) == _norm(table_title):
                     table = t
                     break
+    
+    # Priority 4: Use column_key from selections if available
+    if table and selections and table.get("title") in selections:
+        selection = selections[table.get("title")]
+        if "column_key" in selection:
+            col_key = selection["column_key"]
     
     return (table, col_key) if table else None
 
@@ -546,8 +552,80 @@ def _update_question_and_base_with_selections(slide, table: Dict[str, Any], sele
             if hasattr(shape, "text_frame"):
                 # Use current selection for base text if available
                 if "base_text" in table_selection:
-                    new_text = table_selection["base_text"]
-                    print(f"DEBUG: Base text from selection: '{new_text}'")
+                    # Get the base text from selection
+                    base_text_template = table_selection["base_text"]
+                    
+                    # If column_key is specified in selections, update the N value from that column
+                    if "column_key" in table_selection:
+                        column_key = table_selection["column_key"]
+                        # Find the base row and selected column to get the N value
+                        base_idx = None
+                        col_idx = None
+                        
+                        # Find base row index
+                        row_labels = table.get("row_labels", [])
+                        for i, lab in enumerate(row_labels):
+                            if isinstance(lab, str) and lab.strip().lower().startswith("base"):
+                                base_idx = i
+                                break
+                        
+                        # Find column index
+                        col_labels = table.get("col_labels", [])
+                        if column_key in col_labels:
+                            col_idx = col_labels.index(column_key)
+                        
+                        # Get the new N value if both indices are found
+                        new_n_value = None
+                        if base_idx is not None and col_idx is not None and base_idx < len(table.get("values", [])):
+                            try:
+                                row_values = table["values"][base_idx]
+                                if col_idx < len(row_values):
+                                    new_n_value = int(round(float(row_values[col_idx])))
+                            except Exception:
+                                pass
+                        
+                        # Update the base text with the new N value
+                        if new_n_value is not None:
+                            # Extract the custom description from the base text template
+                            if "Base:" in base_text_template:
+                                # Look for patterns like "Base: Total respondents. 123 complete surveys."
+                                base_parts = base_text_template.split(".")
+                                if len(base_parts) >= 2:
+                                    # First part contains the custom description
+                                    custom_desc = base_parts[0].replace("Base:", "").strip()
+                                    # Clean up any trailing punctuation or equals signs
+                                    custom_desc = custom_desc.rstrip(" =").strip()
+                                    new_text = f"Base: {custom_desc}. {new_n_value:,} complete surveys."
+                                else:
+                                    # No period, might be just "Base: Total respondents 123"
+                                    base_parts = base_text_template.split()
+                                    if len(base_parts) >= 3:
+                                        # Extract everything after "Base:" but before the number
+                                        base_idx_text = base_parts.index("Base:")
+                                        if base_idx_text >= 0 and base_idx_text + 1 < len(base_parts):
+                                            # Find where the number starts
+                                            for i in range(base_idx_text + 1, len(base_parts)):
+                                                if base_parts[i].replace(",", "").isdigit():
+                                                    custom_desc = " ".join(base_parts[base_idx_text + 1:i])
+                                                    # Clean up any trailing punctuation or equals signs
+                                                    custom_desc = custom_desc.rstrip(" =").strip()
+                                                    new_text = f"Base: {custom_desc}. {new_n_value:,} complete surveys."
+                                                    break
+                                            else:
+                                                new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
+                                        else:
+                                            new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
+                                    else:
+                                        new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
+                            else:
+                                new_text = f"Base: {base_text_template}. {new_n_value:,} complete surveys."
+                        else:
+                            new_text = base_text_template
+                    else:
+                        new_text = base_text_template
+                    
+                    print(f"DEBUG: Base text from selection: '{base_text_template}'")
+                    print(f"DEBUG: Final base text: '{new_text}'")
                     print(f"DEBUG: Current shape text before update: '{shape.text_frame.text}'")
                     
                     # Preserve formatting by only updating the text content
@@ -639,6 +717,91 @@ def _update_question_and_base_with_selections(slide, table: Dict[str, Any], sele
     
     print(f"DEBUG: Total shapes updated for table '{table_title}': {shape_count}")
 
+def _update_new_text_callout_system(slide, table: Dict[str, Any], col_key: Optional[str]):
+    """Update new TextCallout objects based on alt text mapping, incorporating actual data values."""
+    for shape in slide.shapes:
+        alt = _parse_alt_text(shape)
+        
+        # Update new text callouts
+        if alt.get("type") == "text_callout" and alt.get("table_title") == table.get("title"):
+            if hasattr(shape, "text_frame"):
+                # Get callout information from alt text
+                row_label = alt.get("row_label", "")
+                column = alt.get("column", "Total")
+                
+                # Get the current text from the shape to see if it has custom formatting
+                current_shape_text = shape.text_frame.text if hasattr(shape, "text_frame") else ""
+                
+                # Try to find the row and column indices
+                row_idx = None
+                col_idx = None
+                
+                if row_label:
+                    # Find row index
+                    row_labels = table.get("row_labels", [])
+                    for i, label in enumerate(row_labels):
+                        if isinstance(label, str) and row_label.lower() in label.lower():
+                            row_idx = i
+                            break
+                    
+                    # Find column index
+                    col_labels = table.get("col_labels", [])
+                    if column in col_labels:
+                        col_idx = col_labels.index(column)
+                    else:
+                        # Fallback to common column names
+                        for fallback in ["Total", "Overall", "All", "Base"]:
+                            if fallback in col_labels:
+                                col_idx = col_labels.index(fallback)
+                                break
+                        if col_idx is None:
+                            col_idx = 0 if col_labels else None
+                    
+                    # Get the actual value if both indices are found
+                    if row_idx is not None and col_idx is not None:
+                        try:
+                            values = table.get("values", [])
+                            if row_idx < len(values) and col_idx < len(values[row_idx]):
+                                value = values[row_idx][col_idx]
+                                if value is not None:
+                                    # Format the value appropriately
+                                    formatted_value = ""
+                                    if isinstance(value, (int, float)):
+                                        if hasattr(value, 'is_integer') and value.is_integer():
+                                            formatted_value = str(int(value))
+                                        else:
+                                            formatted_value = f"{value:.1f}%"
+                                    else:
+                                        formatted_value = str(value)
+                                    
+                                    # Check if the current text has custom formatting with [Value] placeholder
+                                    if current_shape_text and "[Value]" in current_shape_text:
+                                        new_text = current_shape_text.replace("[Value]", formatted_value)
+                                    else:
+                                        # Use default format
+                                        new_text = f"{row_label}: {formatted_value}"
+                        except (IndexError, TypeError, AttributeError):
+                            pass
+                
+                # If no custom formatting found, use default
+                if not new_text:
+                    new_text = f"{row_label}: [Value]"
+                
+                # Update the text while preserving formatting
+                current_text = shape.text_frame.text
+                if current_text != new_text:
+                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
+                        paragraph = shape.text_frame.paragraphs[0]
+                        if paragraph.runs:
+                            paragraph.runs[0].text = new_text
+                        else:
+                            run = paragraph.add_run()
+                            run.text = new_text
+                    else:
+                        shape.text_frame.text = new_text
+                    
+                    print(f"✓ Updated text callout '{row_label}' for table: {table.get('title')}")
+
 def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selections: dict = None) -> str:
     prs = Presentation(pptx_in)
     data = parse_workbook(crosstab_xlsx)
@@ -672,7 +835,7 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
             
             # Handle charts
             if hasattr(shp, "chart"):
-                chart_mapping = _get_chart_mapping_from_shape(shp, data)
+                chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
                 if chart_mapping:
                     table, col_key = chart_mapping
                     _update_chart(shp, table, col_key, explicit_rows=None)
@@ -695,6 +858,10 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
                             _update_question_and_base(slide, table, None, None)
                     else:
                         _update_question_and_base(slide, table, None, None)
+                    
+                    # Update text callouts for this table
+                    _update_new_text_callout_system(slide, table, col_key)
+                    
                     update_log["charts_updated"] += 1
                     print(f"✓ Updated chart with existing mapping for table: {table.get('title')}")
                 else:
@@ -726,6 +893,10 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
                             _update_question_and_base(slide, table, None, None)
                     else:
                         _update_question_and_base(slide, table, None, None)
+                    
+                    # Update text callouts for this table
+                    _update_new_text_callout_system(slide, table, None)
+                    
                     update_log["tables_updated"] += 1
                     print(f"✓ Updated table with existing mapping for table: {table.get('title')}")
                 else:

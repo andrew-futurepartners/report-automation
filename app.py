@@ -21,7 +21,7 @@ def parse_existing_powerpoint(pptx_file):
             for shape in slide.shapes:
                 alt = _parse_alt_text(shape)
                 
-                if alt.get("type") in ["chart", "table", "question_text", "text_base", "text_title"]:
+                if alt.get("type") in ["chart", "table", "question_text", "text_base", "text_title", "text_callout"]:
                     table_title = alt.get("table_title")
                     if table_title:
                         if table_title not in existing_content:
@@ -31,7 +31,8 @@ def parse_existing_powerpoint(pptx_file):
                                 "base_text": "",
                                 "chart_type": "bar_h",
                                 "custom_base_description": "",  # Store custom base description
-                                "custom_question": ""  # Store custom question text
+                                "custom_question": "",  # Store custom question text
+                                "callouts": []  # Initialize callouts list
                             }
                         
                         # Extract question text
@@ -77,6 +78,22 @@ def parse_existing_powerpoint(pptx_file):
                         # Extract chart title
                         elif alt.get("type") == "text_title" and hasattr(shape, "text_frame"):
                             existing_content[table_title]["title"] = shape.text_frame.text
+                        
+                        # Extract text callouts
+                        elif alt.get("type") == "text_callout" and hasattr(shape, "text_frame"):
+                            if "callouts" not in existing_content[table_title]:
+                                existing_content[table_title]["callouts"] = []
+                            
+                            callout_text = shape.text_frame.text
+                            callout_info = {
+                                "row_label": alt.get("row_label", ""),
+                                "column_key": alt.get("column", "Total"),
+                                "text": callout_text,
+                                "position": (0.5, 7.0, 9.0, 0.4),  # Default position
+                                "font_size": 12,
+                                "font_bold": True
+                            }
+                            existing_content[table_title]["callouts"].append(callout_info)
         
         return existing_content
     except Exception as e:
@@ -161,6 +178,16 @@ if uploaded:
                 else:
                     choice = st.session_state["selections"].get(tid, {}).get("chart_type_label", default_choice)
                 choice = st.selectbox("Chart type", options, key=f"ctype_{tid}", index=options.index(choice))
+                
+                # Column selection for this table
+                col_options = t["col_labels"]
+                current_col = st.session_state["selections"].get(tid, {}).get("column_key", "Total")
+                if current_col not in col_options:
+                    current_col = "Total" if "Total" in col_options else col_options[0] if col_options else "Total"
+                
+                selected_col = st.selectbox("Data column", col_options, 
+                                         index=col_options.index(current_col) if current_col in col_options else 0,
+                                         key=f"col_{tid}")
             with cols[2]:
                 # Use existing content if available, otherwise use defaults
                 existing_table = existing_content.get(t["title"], {})
@@ -251,7 +278,148 @@ if uploaded:
                 
                 question_text_val = st.text_input(question_label, value=default_q, key=f"qtext_{tid}")
 
-            st.session_state["selections"][tid] = {
+            # Callout management section
+            st.write("**Callouts**")
+            
+            # Check if there are existing callouts from PowerPoint or session state
+            existing_callouts = existing_table.get("callouts", []) if existing_table else []
+            current_callouts = st.session_state["selections"].get(tid, {}).get("callouts", [])
+            total_callout_count = len(existing_callouts) + len(current_callouts)
+            
+            # Determine if callouts should be enabled by default
+            # Enable if there are existing callouts or if user has previously enabled them
+            default_enabled = (total_callout_count > 0 or 
+                             st.session_state.get(f"enable_callouts_{tid}", False))
+            
+            # Toggle checkbox for callouts
+            toggle_label = f"Enable callouts for this table"
+            if total_callout_count > 0:
+                toggle_label += f" ({total_callout_count} active)"
+            
+            enable_callouts = st.checkbox(toggle_label, value=default_enabled, key=f"enable_callouts_{tid}")
+            
+            if enable_callouts:
+                st.info("💡 Select a row and column, then click 'Add Callout' to create text callouts")
+            else:
+                # Clear any existing callouts when disabled
+                if "callouts" in st.session_state["selections"].get(tid, {}):
+                    st.session_state["selections"][tid]["callouts"] = []
+            
+            if enable_callouts:
+                # Only show callout controls when enabled
+                callout_cols = st.columns([2, 1, 1])
+                
+                with callout_cols[0]:
+                    # Row selection for callouts
+                    available_rows = [row for row in t["row_labels"] if isinstance(row, str) and row.strip()]
+                    selected_row = st.selectbox("Select row for callout", available_rows, key=f"callout_row_{tid}")
+                
+                with callout_cols[1]:
+                    # Column selection for callout (defaults to selected column for chart)
+                    callout_col = st.selectbox("Callout column", col_options, 
+                                             index=col_options.index(selected_col) if selected_col in col_options else 0,
+                                             key=f"callout_col_{tid}")
+                
+                with callout_cols[2]:
+                    # Only show add callout button if no callouts exist yet
+                    if total_callout_count == 0:
+                        if st.button("Add Callout", key=f"add_callout_{tid}"):
+                            if "callouts" not in st.session_state["selections"][tid]:
+                                st.session_state["selections"][tid]["callouts"] = []
+                            
+                            # Create new callout with default text format
+                            default_text = f"{selected_row}: [Value]"
+                            new_callout = {
+                                "row_label": selected_row,
+                                "column_key": callout_col,
+                                "text": default_text,  # Start with default "Row Name: Value" format
+                                "position": (0.5, 7.0, 9.0, 0.4),
+                                "font_size": 12,
+                                "font_bold": True
+                            }
+                            
+                            st.session_state["selections"][tid]["callouts"].append(new_callout)
+                            st.success(f"Added callout for '{selected_row}'")
+                            st.rerun()  # Refresh to update the UI
+                    else:
+                        st.info("📝 Callouts already exist for this table")
+                
+                # Display existing callouts with editable text boxes
+                
+                # Show existing callouts from PowerPoint with "Previously:" indicator
+                if existing_callouts:
+                    st.write("**Existing Callouts from PowerPoint:**")
+                    for i, existing_callout in enumerate(existing_callouts):
+                        callout_display_cols = st.columns([4, 1, 1, 1])
+                        
+                        with callout_display_cols[0]:
+                            # Show the callout info with "Previously:" indicator
+                            st.write(f"• {existing_callout['row_label']} → {existing_callout['column_key']}")
+                            
+                            # Editable text box showing existing callout text with "Previously:" label
+                            callout_label = "Callout text (Previously: " + existing_callout['text'] + ")"
+                            updated_text = st.text_input(
+                                callout_label,
+                                value=existing_callout['text'],
+                                key=f"existing_callout_text_{tid}_{i}",
+                                help="Customize your callout text. Use [Value] as a placeholder for the actual data value."
+                            )
+                            
+                            # Update the existing callout text in real-time
+                            if updated_text != existing_callout['text']:
+                                existing_callouts[i]['text'] = updated_text
+                        
+                        with callout_display_cols[1]:
+                            if st.button("Remove", key=f"remove_existing_callout_{tid}_{i}"):
+                                existing_callouts.pop(i)
+                                st.rerun()
+                        
+                        with callout_display_cols[2]:
+                            if st.button("Edit", key=f"edit_existing_callout_{tid}_{i}"):
+                                st.session_state["editing_existing_callout"] = (tid, i)
+                                st.rerun()
+                        
+                        # Add some spacing between callouts
+                        st.divider()
+                
+                # Show current callouts from session state
+                if current_callouts:
+                    st.write("**Current Callouts:**")
+                    for i, callout in enumerate(current_callouts):
+                        callout_display_cols = st.columns([4, 1, 1, 1])
+                        
+                        with callout_display_cols[0]:
+                            # Show the callout info and editable text box
+                            st.write(f"• {callout['row_label']} → {callout['column_key']}")
+                            
+                            # Editable text box for customizing callout text
+                            current_text = callout.get('text', f"{callout['row_label']}: [Value]")
+                            updated_text = st.text_input(
+                                "Callout text (customize as needed):",
+                                value=current_text,
+                                key=f"callout_text_{tid}_{i}",
+                                help="Customize your callout text. Use [Value] as a placeholder for the actual data value."
+                            )
+                            
+                            # Update the callout text in real-time
+                            if updated_text != current_text:
+                                st.session_state["selections"][tid]["callouts"][i]["text"] = updated_text
+                        
+                        with callout_display_cols[1]:
+                            if st.button("Remove", key=f"remove_callout_{tid}_{i}"):
+                                st.session_state["selections"][tid]["callouts"].pop(i)
+                                st.rerun()
+                        
+                        with callout_display_cols[2]:
+                            if st.button("Edit", key=f"edit_callout_{tid}_{i}"):
+                                st.session_state["editing_callout"] = (tid, i)
+                                st.rerun()
+                        
+                        # Add some spacing between callouts
+                        st.divider()
+
+            # Build selections dictionary
+            selection_dict = {
                 "chart_type_label": choice,
                 "chart_type": {
                     "Bar Horizontal": "bar_h",
@@ -260,15 +428,34 @@ if uploaded:
                     "Line":           "line",
                     "Chart + Table":  "chart+table"
                 }[choice],
+                "column_key": selected_col,  # Add selected column to selections
                 "title": title_val,
                 "base_text": base_text_val,
                 "question_text": question_text_val
             }
+            
+            # Include callouts if the checkbox is enabled
+            if enable_callouts:
+                # Combine existing callouts from PowerPoint with new callouts from session state
+                all_callouts = []
+                
+                # Add existing callouts from PowerPoint (if any)
+                if existing_table and "callouts" in existing_table:
+                    all_callouts.extend(existing_table["callouts"])
+                
+                # Add new callouts from session state (if any)
+                if "callouts" in st.session_state["selections"].get(tid, {}):
+                    all_callouts.extend(st.session_state["selections"][tid]["callouts"])
+                
+                if all_callouts:
+                    selection_dict["callouts"] = all_callouts
+            
+            st.session_state["selections"][tid] = selection_dict
 
     st.divider()
     if action == "Export new PowerPoint":
         if st.button("Export PowerPoint"):
-            sels = {tid: {"chart_type": v["chart_type"], "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text")}
+            sels = {tid: {"chart_type": v["chart_type"], "column_key": v.get("column_key", "Total"), "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text"), "callouts": v.get("callouts", [])}
                     for tid, v in st.session_state["selections"].items()}
             out = "report.pptx"
             export_pptx(data["tables"], sels, out)
@@ -281,8 +468,35 @@ if uploaded:
             if st.button("Update PowerPoint"):
                 # For updates, we want to use the current text box values from the UI
                 # This allows users to edit the text and have those edits reflected in the updated report
-                sels = {tid: {"chart_type": v["chart_type"], "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text")}
-                        for tid, v in st.session_state["selections"].items()}
+                # Build selections including existing callouts from PowerPoint
+                sels = {}
+                for tid, v in st.session_state["selections"].items():
+                    table_selection = {
+                        "chart_type": v["chart_type"],
+                        "column_key": v.get("column_key", "Total"),
+                        "title": v["title"],
+                        "base_text": v.get("base_text"),
+                        "question_text": v.get("question_text")
+                    }
+                    
+                    # Include callouts if enabled
+                    if st.session_state.get(f"enable_callouts_{tid}", False):
+                        # Combine existing callouts from PowerPoint with new callouts
+                        all_callouts = []
+                        
+                        # Add existing callouts from PowerPoint (if any)
+                        existing_table = existing_content.get(tid, {})
+                        if existing_table and "callouts" in existing_table:
+                            all_callouts.extend(existing_table["callouts"])
+                        
+                        # Add new callouts from session state (if any)
+                        if "callouts" in v:
+                            all_callouts.extend(v["callouts"])
+                        
+                        if all_callouts:
+                            table_selection["callouts"] = all_callouts
+                    
+                    sels[tid] = table_selection
                 
                 with open("to_update.pptx", "wb") as pf:
                     pf.write(existing_ppt.getbuffer())

@@ -5,7 +5,8 @@ from pptx.enum.chart import XL_CHART_TYPE
 from pptx.chart.data import ChartData
 from pptx.dml.color import RGBColor
 import json
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
+from dataclasses import dataclass
 
 # Minimal brand theme
 BRAND = {
@@ -23,6 +24,98 @@ BRAND = {
         RGBColor(255, 99, 132),
     ]
 }
+
+@dataclass
+class TextCallout:
+    """Represents a text callout that can be associated with table data."""
+    
+    # Core identification
+    table_title: str   # The table this callout belongs to
+    column_key: str    # The column this callout references (e.g., "Total", "Age 18-24")
+    row_label: str     # Specific row label this callout targets
+    
+    # Display properties
+    text: Optional[str] = None          # Custom text override (if None, uses callout_type)
+    position: tuple = (0.5, 7.0, 9.0, 0.4)  # (x, y, width, height) in inches
+    font_size: int = 12
+    font_bold: bool = True
+    font_color: Optional[RGBColor] = None
+    
+    # Metadata for mapping
+    bind_question: str = "TEXT_QUESTION"
+    bind_base: str = "TEXT_BASE"
+    auto_update: bool = True
+    
+    def __post_init__(self):
+        """Set default text if not provided."""
+        if self.text is None:
+            self.text = f"{self.row_label}: [Value]"
+    
+    def get_display_text(self, table_data: Optional[Dict[str, Any]] = None) -> str:
+        """Get the text to display, incorporating data from the table."""
+        if table_data:
+            # Try to find the actual value for this callout
+            row_idx = self._find_row_index(table_data)
+            col_idx = self._find_column_index(table_data)
+            
+            if row_idx is not None and col_idx is not None:
+                try:
+                    value = table_data["values"][row_idx][col_idx]
+                    if value is not None:
+                        # Format the value appropriately
+                        formatted_value = ""
+                        if isinstance(value, (int, float)):
+                            if hasattr(value, 'is_integer') and value.is_integer():
+                                formatted_value = str(int(value))
+                            else:
+                                formatted_value = f"{value:.1f}%"
+                        else:
+                            formatted_value = str(value)
+                        
+                        # Replace [Value] placeholder with actual value in custom text
+                        if self.text and "[Value]" in self.text:
+                            return self.text.replace("[Value]", formatted_value)
+                        else:
+                            # Fallback to default format if no custom text or no [Value] placeholder
+                            return f"{self.row_label}: {formatted_value}"
+                except (IndexError, TypeError):
+                    pass
+        
+        # Return custom text if available, otherwise fallback to default
+        return self.text if self.text else f"{self.row_label}: [Value]"
+    
+    def _find_row_index(self, table_data: Dict[str, Any]) -> Optional[int]:
+        """Find the row index for this callout."""
+        row_labels = table_data.get("row_labels", [])
+        for i, label in enumerate(row_labels):
+            if isinstance(label, str) and self.row_label.lower() in label.lower():
+                return i
+        return None
+    
+    def _find_column_index(self, table_data: Dict[str, Any]) -> Optional[int]:
+        """Find the column index for this callout."""
+        col_labels = table_data.get("col_labels", [])
+        if self.column_key in col_labels:
+            return col_labels.index(self.column_key)
+        
+        # Fallback to common column names
+        for fallback in ["Total", "Overall", "All", "Base"]:
+            if fallback in col_labels:
+                return col_labels.index(fallback)
+        
+        return 0 if col_labels else None
+    
+    def to_mapping_dict(self) -> Dict[str, Any]:
+        """Convert to mapping dictionary for alt text."""
+        return {
+            "type": "text_callout",
+            "table_title": self.table_title,
+            "column": self.column_key,
+            "row_label": self.row_label,
+            "bind_question": self.bind_question,
+            "bind_base": self.bind_base,
+            "auto_update": "yes" if self.auto_update else "no"
+        }
 
 def _apply_background(slide):
     fill = slide.background.fill
@@ -63,6 +156,35 @@ def add_question_text(slide, question_text, table_title, position=(0.5, 1.0, 9.0
     run.font.name = BRAND["font_family_body"]
     
     return qb
+
+def add_text_callout(slide, callout: TextCallout, table_data: Optional[Dict[str, Any]] = None):
+    """Add a text callout to the slide with proper alt text for mapping."""
+    x, y, w, h = [Inches(pos) for pos in callout.position]
+    callout_box = slide.shapes.add_textbox(x, y, w, h)
+    
+    # Set alt text for mapping using _tag_shape
+    _tag_shape(callout_box, "text_callout", callout.table_title, callout.column_key, 
+               callout.bind_question, callout.bind_base, callout.row_label)
+    
+    # Set the text content
+    tf = callout_box.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    
+    # Get the display text (with data if available)
+    display_text = callout.get_display_text(table_data)
+    run.text = display_text
+    
+    # Apply formatting
+    run.font.size = Pt(callout.font_size)
+    run.font.bold = callout.font_bold
+    run.font.name = BRAND["font_family_body"]
+    
+    if callout.font_color:
+        run.font.color.rgb = callout.font_color
+    
+    return callout_box
 
 def _chart_type_map(kind: str):
     kind = (kind or "").lower()
@@ -136,7 +258,7 @@ def _set_alt_text(shape, mapping: dict):
         pass
 
 def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = None,
-               bind_question: str = "TEXT_QUESTION", bind_base: str = "TEXT_BASE"):
+               bind_question: str = "TEXT_QUESTION", bind_base: str = "TEXT_BASE", row_label: str | None = None):
     """Tag shapes with alt text only - no shape naming."""
     
     if obj_type == "chart":
@@ -183,6 +305,15 @@ def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = Non
             "column": col_key or "Total",  # Add column attribute
             "auto_update": "yes"
         })
+        
+    elif obj_type == "text_callout":
+        _set_alt_text(shape, {
+            "type": "text_callout",
+            "table_title": table_title,
+            "column": col_key or "Total",
+            "row_label": row_label or "",
+            "auto_update": "yes"
+        })
 
 def _add_table(slide, col_labels: List[str], row_labels: List[str], values: List[List[float]]):
     rows = 1 + len(row_labels)
@@ -213,7 +344,7 @@ def _add_table(slide, col_labels: List[str], row_labels: List[str], values: List
 
     return table_shape
 
-def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None, question_text: str | None = None):
+def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None, question_text: str | None = None, callouts: List[TextCallout] | None = None):
     slide = prs.slides.add_slide(prs.slide_layouts[layout])
     _apply_background(slide)
     
@@ -322,6 +453,38 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
         run.font.size = Pt(10)
         run.font.name = BRAND["font_family_body"]
 
+    # Add text callouts if provided
+    if callouts:
+        # Calculate starting position for callouts
+        callout_start_y = 7.0
+        if base_text:
+            callout_start_y += 0.5  # Move callouts down if base text is present
+        if question_text:
+            callout_start_y += 0.4  # Move callouts down if question text is present
+        
+        # Position callouts vertically, adjusting for multiple callouts
+        for i, callout in enumerate(callouts):
+            # Adjust position for this specific callout
+            callout_position = list(callout.position)
+            callout_position[1] = callout_start_y + (i * 0.5)  # Stack vertically with 0.5" spacing
+            
+            # Create a copy of the callout with adjusted position
+            adjusted_callout = TextCallout(
+                table_title=callout.table_title,
+                column_key=callout.column_key,
+                row_label=callout.row_label,
+                text=callout.text,
+                position=tuple(callout_position),
+                font_size=callout.font_size,
+                font_bold=callout.font_bold,
+                font_color=callout.font_color,
+                bind_question=callout.bind_question,
+                bind_base=callout.bind_base,
+                auto_update=callout.auto_update
+            )
+            
+            add_text_callout(slide, adjusted_callout, table)
+
     # Embed small metadata box, can be ignored by updater
     meta = {
         "table_key": table.get("title"),
@@ -329,6 +492,7 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
         "col_labels": col_labels,
         "chart_kind": chart_kind,
         "include_table": include_table,
+        "callout_count": len(callouts) if callouts else 0,
     }
     meta_json = json.dumps(meta)
     meta_box = slide.shapes.add_textbox(Inches(0.0), Inches(7.45), Inches(0.1), Inches(0.2))
@@ -359,6 +523,28 @@ def export_pptx(tables: List[Dict[str, Any]], selections: Dict[str, Dict[str, An
             include_table = True
             ctype = "bar_h"
         title = sel.get("title") or t["title"]
+        
+        # Process callouts if specified in selections
+        callouts = None
+        if "callouts" in sel:
+            callouts = []
+            for callout_data in sel["callouts"]:
+                # Create TextCallout object from selection data
+                callout = TextCallout(
+                    table_title=t.get("title", ""),
+                    column_key=callout_data.get("column_key", "Total"),
+                    row_label=callout_data.get("row_label"),
+                    text=callout_data.get("text"),
+                    position=callout_data.get("position", (0.5, 7.0, 9.0, 0.4)),
+                    font_size=callout_data.get("font_size", 12),
+                    font_bold=callout_data.get("font_bold", True),
+                    font_color=callout_data.get("font_color"),
+                    bind_question=callout_data.get("bind_question", "TEXT_QUESTION"),
+                    bind_base=callout_data.get("bind_base", "TEXT_BASE"),
+                    auto_update=callout_data.get("auto_update", True)
+                )
+                callouts.append(callout)
+        
         add_chart_slide(
             prs,
             t,
@@ -368,7 +554,119 @@ def export_pptx(tables: List[Dict[str, Any]], selections: Dict[str, Dict[str, An
             chart_title=title,
             base_text=sel.get("base_text"),
             question_text=sel.get("question_text"),
+            callouts=callouts,
         )
 
     prs.save(out_path)
     return out_path
+
+def create_row_callout(table_title: str, row_label: str, column_key: str = "Total", 
+                      custom_text: str = None, position: tuple = (0.5, 7.0, 9.0, 0.4)) -> TextCallout:
+    """Create a callout for a specific row in a table."""
+    return TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label=row_label,
+        text=custom_text,
+        position=position,
+        font_size=12,
+        font_bold=True
+    )
+
+def create_common_callouts(table_title: str, column_key: str = "Total") -> List[TextCallout]:
+    """Create a list of common callout types for a table."""
+    callouts = []
+    
+    # Top Box callouts
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Top 3 Box",
+        text="Top 3 Box",
+        position=(0.5, 7.0, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Top 2 Box", 
+        text="Top 2 Box",
+        position=(5.0, 7.0, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    # Bottom Box callouts
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Bottom 2 Box",
+        text="Bottom 2 Box",
+        position=(0.5, 7.5, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Bottom 3 Box",
+        text="Bottom 3 Box",
+        position=(5.0, 7.5, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    return callouts
+
+def create_statistical_callouts(table_title: str, column_key: str = "Total") -> List[TextCallout]:
+    """Create statistical callouts like Average, Mean, etc."""
+    callouts = []
+    
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Average",
+        text="Average",
+        position=(0.5, 7.0, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Mean",
+        text="Mean",
+        position=(5.0, 7.0, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    callouts.append(TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label="Total Spend",
+        text="Total Spend",
+        position=(0.5, 7.5, 4.0, 0.4),
+        font_size=12,
+        font_bold=True
+    ))
+    
+    return callouts
+
+def create_custom_callout(table_title: str, column_key: str = "Total", 
+                         row_label: str = None, custom_text: str = None, 
+                         position: tuple = (0.5, 7.0, 9.0, 0.4)) -> TextCallout:
+    """Create a custom callout with specific parameters."""
+    return TextCallout(
+        table_title=table_title,
+        column_key=column_key,
+        row_label=row_label or "Custom",
+        text=custom_text,
+        position=position,
+        font_size=12,
+        font_bold=True
+    )
