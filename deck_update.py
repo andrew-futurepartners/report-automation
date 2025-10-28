@@ -76,6 +76,7 @@ def _choose_col_idx(col_labels: List[str], col_key: Optional[str]) -> Optional[i
     return 0
 
 def _series_from_table(table: Dict[str, Any], col_idx: Optional[int], exclude_rows: set):
+    import math
     cats, vals = [], []
     row_labels = table["row_labels"]
     values = table["values"]
@@ -87,7 +88,23 @@ def _series_from_table(table: Dict[str, Any], col_idx: Optional[int], exclude_ro
             vals.append(None)
         else:
             row = values[i]
-            vals.append(row[col_idx] if col_idx < len(row) else None)
+            val = row[col_idx] if col_idx < len(row) else None
+            
+            # Clean the value to handle NaN and infinite values
+            if val is not None:
+                try:
+                    # Convert to float to check for NaN/inf
+                    float_val = float(val)
+                    if math.isnan(float_val) or math.isinf(float_val):
+                        # Replace NaN/inf with None (which becomes 0 in charts)
+                        val = None
+                    else:
+                        val = float_val
+                except (ValueError, TypeError):
+                    # If conversion fails, treat as None
+                    val = None
+            
+            vals.append(val)
     return cats, vals
 
 def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit_rows: Optional[List[str]]):
@@ -178,7 +195,15 @@ def _update_table(shape, table: Dict[str, Any]):
             if j is not None and ci is not None:
                 try:
                     val = table["values"][j][ci]
-                    txt = "" if val is None else f"{float(val):.1f}"
+                    if val is not None:
+                        import math
+                        float_val = float(val)
+                        if math.isnan(float_val) or math.isinf(float_val):
+                            txt = ""  # Display empty for NaN/inf values
+                        else:
+                            txt = f"{float_val:.1f}"
+                    else:
+                        txt = ""
                 except Exception:
                     txt = ""
             
@@ -833,8 +858,11 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
                 update_log["shapes_skipped"] += 1
                 continue
             
-            # Handle charts
-            if hasattr(shp, "chart"):
+            # Handle charts - use try/except to safely check for charts
+            try:
+                # Try to access the chart property - this will raise ValueError if no chart
+                chart = shp.chart
+                # If we get here, the shape contains a chart
                 chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
                 if chart_mapping:
                     table, col_key = chart_mapping
@@ -868,9 +896,13 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
                     # No mapping found - preserve the chart as-is
                     print(f"⚠️ Chart '{name}' has no table mapping - preserving as-is")
                     update_log["shapes_skipped"] += 1
+            except (ValueError, AttributeError):
+                # Shape doesn't contain a chart or doesn't have chart attribute
+                print(f"⚠️ Shape '{name}' doesn't contain a chart - skipping")
+                pass
             
             # Handle tables
-            elif shp.has_table:
+            if shp.has_table:
                 table = _get_table_mapping_from_shape(shp, data)
                 if table:
                     _update_table(shp, table)
@@ -936,6 +968,234 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
         print(f"\n⚠️ Mapping issues found: {len(update_log['mapping_issues'])}")
         for issue in update_log["mapping_issues"][:3]:  # Show first 3 issues
             print(f"    - {issue}")
+
+    prs.save(pptx_out)
+    return pptx_out
+
+def update_presentation_with_unmapped(pptx_in: str, crosstab_xlsx: str, pptx_out: str, 
+                                    selections: dict = None, all_tables: list = None, 
+                                    existing_content: dict = None) -> str:
+    """Enhanced update function that handles existing mappings and adds unmapped tables page."""
+    prs = Presentation(pptx_in)
+    data = parse_workbook(crosstab_xlsx)
+    
+    # Track what was updated for reporting
+    update_log = {
+        "charts_updated": 0,
+        "tables_updated": 0,
+        "text_updated": 0,
+        "shapes_skipped": 0,
+        "unmapped_tables": [],
+        "mapping_issues": []
+    }
+    
+    # Identify unmapped tables
+    mapped_table_titles = set(existing_content.keys()) if existing_content else set()
+    unmapped_tables = []
+    
+    if all_tables:
+        for table in all_tables:
+            if table["title"] not in mapped_table_titles:
+                unmapped_tables.append(table)
+        update_log["unmapped_tables"] = [t["title"] for t in unmapped_tables]
+
+    # First, update all existing mapped content (same as original function)
+    for slide in prs.slides:
+        for shp in slide.shapes:
+            name = shp.name or ""
+            alt = _parse_alt_text(shp)
+            
+            # Skip shapes that don't want auto-updates
+            if alt.get("auto_update", "yes").lower() == "no":
+                update_log["shapes_skipped"] += 1
+                continue
+            
+            # Handle charts - use try/except to safely check for charts
+            try:
+                # Try to access the chart property - this will raise ValueError if no chart
+                chart = shp.chart
+                # If we get here, the shape contains a chart
+                chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
+                if chart_mapping:
+                    table, col_key = chart_mapping
+                    _update_chart(shp, table, col_key, explicit_rows=None)
+                    
+                    # Update question and base text for this table using current selections if available
+                    if selections:
+                        table_selection = None
+                        table_title = table.get("title")
+                        if table_title and table_title in selections:
+                            table_selection = selections[table_title]
+                        
+                        if table_selection:
+                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
+                        else:
+                            _update_question_and_base(slide, table, None, None)
+                    else:
+                        _update_question_and_base(slide, table, None, None)
+                    
+                    # Update text callouts for this table
+                    _update_new_text_callout_system(slide, table, col_key)
+                    
+                    update_log["charts_updated"] += 1
+                else:
+                    update_log["shapes_skipped"] += 1
+            except (ValueError, AttributeError):
+                # Shape doesn't contain a chart or doesn't have chart attribute
+                pass
+            
+            # Handle tables
+            if shp.has_table:
+                table = _get_table_mapping_from_shape(shp, data)
+                if table:
+                    _update_table(shp, table)
+                    
+                    # Update question and base text for this table using current selections if available
+                    if selections:
+                        table_selection = None
+                        table_title = table.get("title")
+                        if table_title and table_title in selections:
+                            table_selection = selections[table_title]
+                        
+                        if table_selection:
+                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
+                        else:
+                            _update_question_and_base(slide, table, None, None)
+                    else:
+                        _update_question_and_base(slide, table, None, None)
+                    
+                    # Update text callouts for this table
+                    _update_new_text_callout_system(slide, table, None)
+                    
+                    update_log["tables_updated"] += 1
+                else:
+                    update_log["shapes_skipped"] += 1
+
+    # Add unmapped tables summary page
+    if unmapped_tables:
+        from pptx_exporter import add_title, _apply_background
+        from pptx.util import Inches, Pt
+        from pptx.dml.color import RGBColor
+        
+        # Create unmapped tables summary slide
+        unmapped_slide = prs.slides.add_slide(prs.slide_layouts[5])  # Use blank layout
+        _apply_background(unmapped_slide)
+        
+        # Add title
+        add_title(unmapped_slide, "Unmapped Tables Summary")
+        
+        # Add subtitle explaining what this page contains
+        subtitle_box = unmapped_slide.shapes.add_textbox(
+            Inches(0.5), Inches(1.2), Inches(9.0), Inches(0.6)
+        )
+        subtitle_tf = subtitle_box.text_frame
+        subtitle_tf.clear()
+        subtitle_p = subtitle_tf.paragraphs[0]
+        subtitle_run = subtitle_p.add_run()
+        subtitle_run.text = f"The following {len(unmapped_tables)} tables from your crosstab had no existing connections and are listed here for reference:"
+        subtitle_run.font.size = Pt(14)
+        subtitle_run.font.name = "Arial"
+        
+        # Create a simple list of unmapped tables
+        list_y_start = 2.0
+        list_x = 0.5
+        line_height = 0.3
+        
+        for i, table in enumerate(unmapped_tables):
+            # Add table title
+            title_box = unmapped_slide.shapes.add_textbox(
+                Inches(list_x), Inches(list_y_start + i * line_height * 4), Inches(8.5), Inches(0.25)
+            )
+            title_tf = title_box.text_frame
+            title_tf.clear()
+            title_p = title_tf.paragraphs[0]
+            title_run = title_p.add_run()
+            title_run.text = f"• {table['title']}"
+            title_run.font.size = Pt(12)
+            title_run.font.bold = True
+            title_run.font.name = "Arial"
+            
+            # Add basic stats
+            stats_box = unmapped_slide.shapes.add_textbox(
+                Inches(list_x + 0.3), Inches(list_y_start + i * line_height * 4 + 0.25), Inches(8.2), Inches(0.2)
+            )
+            stats_tf = stats_box.text_frame
+            stats_tf.clear()
+            stats_p = stats_tf.paragraphs[0]
+            stats_run = stats_p.add_run()
+            
+            row_count = len(table.get("row_labels", []))
+            col_count = len(table.get("col_labels", []))
+            stats_run.text = f"  Rows: {row_count}, Columns: {col_count}"
+            stats_run.font.size = Pt(10)
+            stats_run.font.name = "Arial"
+            stats_run.font.color.rgb = RGBColor(100, 100, 100)
+            
+            # Add column names
+            if table.get("col_labels"):
+                cols_text = ", ".join(table["col_labels"][:8])  # Show first 8 columns
+                if len(table["col_labels"]) > 8:
+                    cols_text += "..."
+                
+                cols_box = unmapped_slide.shapes.add_textbox(
+                    Inches(list_x + 0.3), Inches(list_y_start + i * line_height * 4 + 0.45), Inches(8.2), Inches(0.2)
+                )
+                cols_tf = cols_box.text_frame
+                cols_tf.clear()
+                cols_p = cols_tf.paragraphs[0]
+                cols_run = cols_p.add_run()
+                cols_run.text = f"  Columns: {cols_text}"
+                cols_run.font.size = Pt(9)
+                cols_run.font.name = "Arial"
+                cols_run.font.color.rgb = RGBColor(120, 120, 120)
+            
+            # Stop if we're running out of space (about 12 tables max)
+            if i >= 11:
+                remaining_count = len(unmapped_tables) - 12
+                if remaining_count > 0:
+                    more_box = unmapped_slide.shapes.add_textbox(
+                        Inches(list_x), Inches(list_y_start + 12 * line_height * 4), Inches(8.5), Inches(0.25)
+                    )
+                    more_tf = more_box.text_frame
+                    more_tf.clear()
+                    more_p = more_tf.paragraphs[0]
+                    more_run = more_p.add_run()
+                    more_run.text = f"... and {remaining_count} more tables"
+                    more_run.font.size = Pt(11)
+                    more_run.font.italic = True
+                    more_run.font.name = "Arial"
+                    more_run.font.color.rgb = RGBColor(150, 150, 150)
+                break
+
+    # Print update summary
+    print(f"\n{'='*60}")
+    print(f"ENHANCED UPDATE SUMMARY")
+    print(f"{'='*60}")
+    print(f"✓ Charts updated: {update_log['charts_updated']}")
+    print(f"✓ Tables updated: {update_log['tables_updated']}")
+    print(f"✓ Text objects updated: {update_log['text_updated']}")
+    print(f"⚠️ Shapes preserved (no mapping): {update_log['shapes_skipped']}")
+    print(f"📄 Unmapped tables added to summary page: {len(unmapped_tables)}")
+    
+    if unmapped_tables:
+        print(f"\n📋 Unmapped tables:")
+        for table in unmapped_tables[:5]:  # Show first 5
+            print(f"  • {table['title']}")
+        if len(unmapped_tables) > 5:
+            print(f"  ... and {len(unmapped_tables) - 5} more")
+    
+    print(f"\n📋 What was updated:")
+    print(f"  • Existing chart/table data refreshed with new crosstab values")
+    print(f"  • Base N values updated while preserving custom descriptions")
+    print(f"  • Question text updated only if using default values")
+    print(f"  • Chart titles preserved if custom")
+    print(f"  • New 'Unmapped Tables Summary' page added with {len(unmapped_tables)} tables")
+    print(f"\n🔒 What was preserved:")
+    print(f"  • All formatting (fonts, colors, sizes, styles)")
+    print(f"  • Custom chart titles and question text")
+    print(f"  • Custom base descriptions")
+    print(f"  • Charts/tables without mappings")
+    print(f"{'='*60}")
 
     prs.save(pptx_out)
     return pptx_out

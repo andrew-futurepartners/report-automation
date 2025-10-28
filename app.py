@@ -1,7 +1,7 @@
 import streamlit as st
 from crosstab_parser import parse_workbook
 from pptx_exporter import export_pptx
-from deck_update import update_presentation
+from deck_update import update_presentation, update_presentation_with_unmapped
 from pptx import Presentation
 from deck_update import _parse_alt_text
 
@@ -100,68 +100,240 @@ def parse_existing_powerpoint(pptx_file):
         st.error(f"Error parsing PowerPoint: {e}")
         return {}
 
-st.set_page_config(page_title="Crosstab to PowerPoint", layout="wide")
+st.set_page_config(page_title="Report Relay", layout="wide")
 
-st.title("Crosstab to PowerPoint")
-st.write("Upload a Q-style crosstab Excel, pick chart types and titles, then export a branded PowerPoint.")
+st.title("Report Relay")
+st.write("An efficient handoff from crosstab to report.")
+
+# Step 1: Choose workflow type
+st.subheader("Step 1: Choose your workflow")
+workflow_type = st.radio(
+    "Are you creating a new report or updating an existing one?",
+    ["Create New Report", "Update Existing Report"],
+    index=0,
+    help="""
+    **Create New Report**: Upload crosstab Excel → Choose chart types and customize → Export new PowerPoint
+    
+    **Update Existing Report**: Upload PowerPoint → Detect connections → Upload crosstab → Review mappings → Update PowerPoint
+    """
+)
 
 # Add helpful workflow information
-with st.expander("💡 How to use this tool", expanded=False):
-    st.write("""
-    **New Report Workflow:**
-    1. Upload crosstab Excel → Choose chart types and customize titles → Export new PowerPoint
+with st.expander("💡 How each workflow works", expanded=False):
+    if workflow_type == "Create New Report":
+        st.write("""
+        **New Report Workflow:**
+        1. Upload crosstab Excel file
+        2. Choose chart types and customize titles for each table
+        3. Export new PowerPoint presentation
+        
+        **Perfect for:** First-time report creation, one-off reports
+        """)
+    else:
+        st.write("""
+        **Update Existing Report Workflow:**
+        1. Upload existing PowerPoint presentation
+        2. System detects existing table connections
+        3. Upload new crosstab Excel file  
+        4. Review tables with/without existing connections
+        5. Configure column selection (switch segments quickly)
+        6. Update presentation (preserves formatting, adds unmapped tables summary)
+        
+        **Perfect for:** Regular report updates, preserving custom formatting and content
+        
+        **Key Benefits:**
+        - Custom work is preserved when updating reports
+        - Base N values are automatically refreshed with new data
+        - Chart titles, questions, and base descriptions can be customized and preserved
+        - New tables are automatically listed on a summary page
+        - Quick segment switching (Total → Male → Female → Gen Z, etc.)
+        """)
+
+# Initialize session state for workflow management
+if "workflow_step" not in st.session_state:
+    st.session_state.workflow_step = "start"
+if "existing_content" not in st.session_state:
+    st.session_state.existing_content = {}
+if "data" not in st.session_state:
+    st.session_state.data = None
+
+# Workflow branching
+if workflow_type == "Create New Report":
+    # NEW REPORT WORKFLOW
+    st.subheader("Step 2: Upload crosstab data")
+    uploaded = st.file_uploader("Upload crosstab Excel", type=["xlsx", "xls"], key="new_report_excel")
     
-    **Update Existing Report Workflow:**
-    1. Upload crosstab Excel → Upload existing PowerPoint → Review what will be preserved/updated → Update PowerPoint
+    if uploaded:
+        with st.spinner("Parsing workbook..."):
+            with open("uploaded.xlsx", "wb") as f:
+                f.write(uploaded.getbuffer())
+            data = parse_workbook("uploaded.xlsx")
+            st.session_state.data = data
+
+        st.success(f"Found {len(data['tables'])} tables")
+        st.divider()
+        
+        # Show default choice controls for new reports
+        st.subheader("Step 3: Configure visualizations")
+        
+        # Get all unique column labels across all tables for column selection
+        all_columns = set()
+        for table in data["tables"]:
+            all_columns.update(table.get("col_labels", []))
+        all_columns = sorted(list(all_columns))
+        
+        # Default selections
+        col1, col2 = st.columns(2)
+        with col1:
+            default_choice = st.selectbox("Default visualization", ["Bar Horizontal", "Bar Vertical", "Donut", "Line", "Chart + Table"], index=0)
+            apply_all_btn = st.button("Apply chart type to all")
+        
+        with col2:
+            default_column = st.selectbox("Default column", all_columns, index=all_columns.index("Total") if "Total" in all_columns else 0)
+            apply_column_btn = st.button("Apply column to all")
+
+else:
+    # UPDATE EXISTING REPORT WORKFLOW
+    st.subheader("Step 2: Upload existing PowerPoint")
+    existing_ppt = st.file_uploader("Upload the PowerPoint to update", type=["pptx"], key="existing_ppt")
     
-    **Key Benefits:**
-    - Custom work is preserved when updating reports
-    - Base N values are automatically refreshed with new data
-    - Chart titles, questions, and base descriptions can be customized and preserved
-    """)
+    if existing_ppt:
+        with st.spinner("Parsing existing PowerPoint..."):
+            existing_content = parse_existing_powerpoint(existing_ppt)
+            st.session_state.existing_content = existing_content
+            # Save the PowerPoint file for later use
+            with open("to_update.pptx", "wb") as pf:
+                pf.write(existing_ppt.getbuffer())
 
-uploaded = st.file_uploader("Upload crosstab Excel", type=["xlsx", "xls"])
-
-default_choice = st.selectbox("Default visualization", ["Bar Horizontal", "Bar Vertical", "Donut", "Line", "Chart + Table"], index=0)
-apply_all_btn = st.button("Apply default to all")
-
-if uploaded:
-    with st.spinner("Parsing workbook..."):
-        with open("uploaded.xlsx", "wb") as f:
-            f.write(uploaded.getbuffer())
-        data = parse_workbook("uploaded.xlsx")
-
-    st.success(f"Found {len(data['tables'])} tables")
-    st.divider()
-
-    # Choose action: Export new vs Update existing
-    action = st.radio("What do you want to do?", ["Export new PowerPoint", "Update existing PowerPoint"], index=0)
-    existing_ppt = None
-    existing_content = {}
-    
-    if action == "Update existing PowerPoint":
-        existing_ppt = st.file_uploader("Upload the PowerPoint to update", type=["pptx"], key="ppt_to_update")
-        if existing_ppt:
-            with st.spinner("Parsing existing PowerPoint..."):
-                existing_content = parse_existing_powerpoint(existing_ppt)
-            if existing_content:
-                st.success(f"Found existing content for {len(existing_content)} tables")
-                
-            st.info("We will refresh tagged charts, tables, Question, and Base using the crosstab you just uploaded. **Custom content will be preserved where possible.**")
+        if existing_content:
+            st.success(f"Found connections for {len(existing_content)} tables")
             
-            # Add helpful information about what gets preserved
-            st.info("""
-            **What gets updated:** Chart data, table values, base N counts
-            **What gets preserved:** Custom chart titles, custom question text, custom base descriptions (e.g., "Total respondents" vs "All participants")
-            **What gets refreshed:** Base N values from the new crosstab data
-            """)
+            # Show found connections
+            with st.expander(f"📊 Found connections for {len(existing_content)} tables", expanded=True):
+                for table_title in existing_content.keys():
+                    st.write(f"• {table_title}")
+        else:
+            st.info("No existing table connections found in this PowerPoint.")
+        
+        st.divider()
+        
+        # Step 3: Upload crosstab for updates
+        st.subheader("Step 3: Upload new crosstab data")
+        uploaded = st.file_uploader("Upload crosstab Excel", type=["xlsx", "xls"], key="update_report_excel")
+        
+        if uploaded:
+            with st.spinner("Parsing workbook..."):
+                with open("uploaded.xlsx", "wb") as f:
+                    f.write(uploaded.getbuffer())
+                data = parse_workbook("uploaded.xlsx")
+                st.session_state.data = data
+
+            st.success(f"Found {len(data['tables'])} tables in crosstab")
+            
+            # Categorize tables into connected vs unconnected
+            connected_tables = []
+            unconnected_tables = []
+            
+            for table in data["tables"]:
+                if table["title"] in existing_content:
+                    connected_tables.append(table)
+                else:
+                    unconnected_tables.append(table)
+            
+            st.divider()
+            
+            # Show categorized results
+            st.subheader("Step 4: Review table connections")
+            
+            # Connected tables section (collapsible)
+            if connected_tables:
+                with st.expander(f"✅ Tables with existing connections ({len(connected_tables)})", expanded=True):
+                    st.success("These tables will be updated with new data while preserving your custom formatting.")
+                    for table in connected_tables:
+                        st.write(f"• {table['title']}")
+            
+            # Unconnected tables section (collapsible)  
+            if unconnected_tables:
+                with st.expander(f"➕ Tables with NO connections ({len(unconnected_tables)})", expanded=True):
+                    st.info("These tables are new or don't have existing connections. They will be added to a summary page.")
+                    for table in unconnected_tables:
+                        st.write(f"• {table['title']}")
+            
+            # Show column selection for update workflow
+            if data["tables"]:
+                # Get all unique column labels across all tables for column selection
+                all_columns = set()
+                for table in data["tables"]:
+                    all_columns.update(table.get("col_labels", []))
+                all_columns = sorted(list(all_columns))
+                
+                st.subheader("Step 5: Configure column selection")
+                st.info("💡 Quickly switch to different segments (e.g., Male, Female, Gen Z) for all connected tables")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    default_column = st.selectbox("Default column for updates", all_columns, 
+                                                index=all_columns.index("Total") if "Total" in all_columns else 0,
+                                                key="update_default_column")
+                    apply_column_btn = st.button("Apply column to all connected tables", key="update_apply_column")
+                
+                with col2:
+                    st.write("**Available segments:**")
+                    # Show first 8 columns as examples
+                    segment_preview = all_columns[:8]
+                    if len(all_columns) > 8:
+                        segment_preview.append(f"... and {len(all_columns) - 8} more")
+                    for col in segment_preview:
+                        st.write(f"• {col}")
+            
+            # Set defaults for the rest of the logic
+            default_choice = "Bar Horizontal"
+            apply_all_btn = False
+        else:
+            # If no data yet, set default values
+            default_column = "Total"
+            apply_column_btn = False
 
     # Selections state
     if "selections" not in st.session_state:
         st.session_state["selections"] = {}
 
+# Only show table configuration if we have data loaded
+if st.session_state.data is not None:
+    data = st.session_state.data
+    existing_content = st.session_state.existing_content
+    
+    # Ensure default_column and apply_column_btn are defined for both workflows
+    if workflow_type == "Create New Report":
+        # These were defined earlier in the new report section
+        pass
+    else:
+        # For update workflow, check if they were defined in the update section
+        if 'default_column' not in locals():
+            default_column = "Total"
+            apply_column_btn = False
+    
+    # Determine which tables to show configuration for
+    if workflow_type == "Create New Report":
+        # Show all tables for new reports
+        tables_to_configure = data["tables"]
+        config_title = "Configure all tables"
+    else:
+        # For updates, only show connected tables that have existing settings
+        # These can be modified if needed
+        tables_to_configure = []
+        for table in data["tables"]:
+            if table["title"] in existing_content:
+                tables_to_configure.append(table)
+        config_title = f"Configure existing tables ({len(tables_to_configure)})"
+    
+    # Only show configuration section if there are tables to configure
+    if tables_to_configure:
+        st.divider()
+        st.subheader(config_title)
+
     # Per-table controls
-    for t in data["tables"]:
+    for t in tables_to_configure:
         tid = t["id"]
         with st.expander(f"{t['title']}  ({tid})", expanded=False):
             cols = st.columns([2, 1, 2])
@@ -181,9 +353,19 @@ if uploaded:
                 
                 # Column selection for this table
                 col_options = t["col_labels"]
-                current_col = st.session_state["selections"].get(tid, {}).get("column_key", "Total")
-                if current_col not in col_options:
-                    current_col = "Total" if "Total" in col_options else col_options[0] if col_options else "Total"
+                
+                # Handle column application for both new reports and updates
+                if workflow_type == "Create New Report" and apply_column_btn:
+                    # Apply default column to all tables for new reports
+                    current_col = default_column if default_column in col_options else ("Total" if "Total" in col_options else col_options[0] if col_options else "Total")
+                elif workflow_type == "Update Existing Report" and apply_column_btn:
+                    # Apply default column to all connected tables for updates
+                    current_col = default_column if default_column in col_options else ("Total" if "Total" in col_options else col_options[0] if col_options else "Total")
+                else:
+                    # Use existing selection or default
+                    current_col = st.session_state["selections"].get(tid, {}).get("column_key", "Total")
+                    if current_col not in col_options:
+                        current_col = "Total" if "Total" in col_options else col_options[0] if col_options else "Total"
                 
                 selected_col = st.selectbox("Data column", col_options, 
                                          index=col_options.index(current_col) if current_col in col_options else 0,
@@ -282,6 +464,7 @@ if uploaded:
             st.write("**Callouts**")
             
             # Check if there are existing callouts from PowerPoint or session state
+            existing_table = existing_content.get(t["title"], {})
             existing_callouts = existing_table.get("callouts", []) if existing_table else []
             current_callouts = st.session_state["selections"].get(tid, {}).get("callouts", [])
             total_callout_count = len(existing_callouts) + len(current_callouts)
@@ -452,56 +635,49 @@ if uploaded:
             
             st.session_state["selections"][tid] = selection_dict
 
-    st.divider()
-    if action == "Export new PowerPoint":
-        if st.button("Export PowerPoint"):
-            sels = {tid: {"chart_type": v["chart_type"], "column_key": v.get("column_key", "Total"), "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text"), "callouts": v.get("callouts", [])}
-                    for tid, v in st.session_state["selections"].items()}
-            out = "report.pptx"
-            export_pptx(data["tables"], sels, out)
+    # Export/Update section
+    if st.session_state.data is not None:
+        st.divider()
+        
+        if workflow_type == "Create New Report":
+            # NEW REPORT EXPORT
+            st.subheader("Step 4: Export new PowerPoint")
+            if st.button("Export PowerPoint", type="primary"):
+                sels = {tid: {"chart_type": v["chart_type"], "column_key": v.get("column_key", "Total"), "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text"), "callouts": v.get("callouts", [])}
+                        for tid, v in st.session_state["selections"].items()}
+                out = "report.pptx"
+                export_pptx(data["tables"], sels, out)
             with open(out, "rb") as f:
                 st.download_button("Download report.pptx", f, file_name="report.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
-    else:
-        if existing_ppt is None:
-            st.info("Upload a PowerPoint to update.")
+        
         else:
-            if st.button("Update PowerPoint"):
-                # For updates, we want to use the current text box values from the UI
-                # This allows users to edit the text and have those edits reflected in the updated report
-                # Build selections including existing callouts from PowerPoint
-                sels = {}
+            # UPDATE EXISTING REPORT
+            st.subheader("Step 6: Update PowerPoint")
+            
+            # Show what will happen
+            connected_count = len([t for t in data["tables"] if t["title"] in existing_content])
+            unconnected_count = len([t for t in data["tables"] if t["title"] not in existing_content])
+            
+            st.info(f"""
+            **Update Summary:**
+            - {connected_count} existing tables will be updated with new data
+            - {unconnected_count} new tables will be added to an "Unmapped Tables" summary page
+            - Custom formatting and content will be preserved where possible
+            """)
+            
+            if st.button("Update PowerPoint", type="primary"):
+                # Build selections for new tables only
+                new_table_sels = {}
                 for tid, v in st.session_state["selections"].items():
-                    table_selection = {
+                    new_table_sels[tid] = {
                         "chart_type": v["chart_type"],
                         "column_key": v.get("column_key", "Total"),
                         "title": v["title"],
                         "base_text": v.get("base_text"),
-                        "question_text": v.get("question_text")
+                        "question_text": v.get("question_text"),
+                        "callouts": v.get("callouts", [])
                     }
-                    
-                    # Include callouts if enabled
-                    if st.session_state.get(f"enable_callouts_{tid}", False):
-                        # Combine existing callouts from PowerPoint with new callouts
-                        all_callouts = []
-                        
-                        # Add existing callouts from PowerPoint (if any)
-                        existing_table = existing_content.get(tid, {})
-                        if existing_table and "callouts" in existing_table:
-                            all_callouts.extend(existing_table["callouts"])
-                        
-                        # Add new callouts from session state (if any)
-                        if "callouts" in v:
-                            all_callouts.extend(v["callouts"])
-                        
-                        if all_callouts:
-                            table_selection["callouts"] = all_callouts
-                    
-                    sels[tid] = table_selection
                 
-                with open("to_update.pptx", "wb") as pf:
-                    pf.write(existing_ppt.getbuffer())
-                
-                # Update the presentation with current selections (including user edits)
                 # Convert selections to use table titles as keys for proper matching
                 table_selections = {}
                 for tid, v in st.session_state["selections"].items():
@@ -516,17 +692,16 @@ if uploaded:
                             }
                             break
                 
-                print(f"DEBUG: Table selections: {table_selections}")
+                # Update presentation with enhanced functionality
+                updated = update_presentation_with_unmapped("to_update.pptx", "uploaded.xlsx", "updated_report.pptx", 
+                                                          table_selections, data["tables"], existing_content)
                 
-                # Debug: Print the exact text values being passed
-                for table_title, selection in table_selections.items():
-                    print(f"DEBUG: Table '{table_title}' selections:")
-                    print(f"  - title: '{selection.get('title')}'")
-                    print(f"  - question_text: '{selection.get('question_text')}'")
-                    print(f"  - base_text: '{selection.get('base_text')}'")
-                
-                updated = update_presentation("to_update.pptx", "uploaded.xlsx", "updated_report.pptx", table_selections)
                 with open(updated, "rb") as f:
                     st.download_button("Download updated_report.pptx", f, file_name="updated_report.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+
+# Show instructions when no data is loaded
+if st.session_state.data is None:
+    if workflow_type == "Create New Report":
+        st.info("👆 Upload a crosstab Excel file to begin creating your report.")
 else:
-    st.info("Upload a workbook to begin.")
+        st.info("👆 Upload an existing PowerPoint file to begin the update process.")

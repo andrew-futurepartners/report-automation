@@ -77,8 +77,71 @@ def parse_workbook(path: str) -> Dict[str, Any]:
             body = sub.iloc[header_row_idx+1:].reset_index(drop=True)
 
             # First column are row labels
-            row_labels = body.iloc[:,0].fillna("").astype(str).tolist()
-            data_part = body.iloc[:,1:].apply(pd.to_numeric, errors="coerce")
+            row_labels_raw = body.iloc[:,0].fillna("").astype(str).tolist()
+            data_part_raw = body.iloc[:,1:].apply(pd.to_numeric, errors="coerce")
+            
+            # Filter out footnote rows - these typically contain text patterns like:
+            # "Total sample", "Multiple comparison", "base n =", "Unweighted", etc.
+            footnote_patterns = [
+                "total sample", "unweighted", "weighted", "base n =", "base:", "n =",
+                "multiple comparison", "false discovery rate", "fdr", "p =", "p<", "p>",
+                "significance", "statistical", "confidence", "margin of error",
+                "fieldwork", "survey", "methodology", "data collection"
+            ]
+            
+            # Additional check for standalone "Base" rows that are likely footnotes
+            base_only_patterns = ["base"]
+            
+            # Identify rows to keep (exclude footnotes)
+            rows_to_keep = []
+            for i, label in enumerate(row_labels_raw):
+                label_lower = label.lower().strip()
+                
+                # Skip empty labels
+                if not label_lower:
+                    continue
+                    
+                # Check if this looks like a footnote
+                is_footnote = False
+                for pattern in footnote_patterns:
+                    if pattern in label_lower:
+                        is_footnote = True
+                        break
+                
+                # Check for standalone "Base" rows (common footnote pattern)
+                if not is_footnote and label_lower in base_only_patterns:
+                    # Check if this Base row has data that looks like sample sizes (>100)
+                    row_data = data_part_raw.iloc[i]
+                    non_null_values = row_data.dropna()
+                    if len(non_null_values) > 0:
+                        # If most values are large numbers (>100), likely sample sizes = footnote
+                        large_values = sum(1 for val in non_null_values if val > 100)
+                        if large_values / len(non_null_values) > 0.5:
+                            is_footnote = True
+                
+                # Also check if the row has mostly NaN values (typical of footnote rows)
+                if not is_footnote:
+                    row_data = data_part_raw.iloc[i]
+                    non_null_count = row_data.count()
+                    total_cols = len(row_data)
+                    # If less than 20% of columns have data, likely a footnote
+                    if total_cols > 0 and (non_null_count / total_cols) < 0.2:
+                        is_footnote = True
+                
+                if not is_footnote:
+                    rows_to_keep.append(i)
+            
+            # Filter the data to keep only non-footnote rows
+            if rows_to_keep:
+                row_labels = [row_labels_raw[i] for i in rows_to_keep]
+                data_part = data_part_raw.iloc[rows_to_keep].reset_index(drop=True)
+            else:
+                # Fallback if all rows were filtered out
+                row_labels = row_labels_raw
+                data_part = data_part_raw
+            
+            # Replace NaN values with None to avoid chart errors
+            data_part = data_part.where(pd.notna(data_part), None)
             col_labels = header[1:len(data_part.columns)+1]
 
             # Title guess: the first non-empty cell above header row, else sheet name + index
