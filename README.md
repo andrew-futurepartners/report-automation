@@ -1,14 +1,17 @@
 # PowerPoint Report Automation
 
-A Streamlit application that exports new PowerPoint reports from crosstab Excel files and updates existing decks with new data. It creates charts, optional data tables, slide titles, question text, and base text, with an updater that refreshes those objects without breaking formatting.
+A Streamlit application that creates and updates PowerPoint reports from Q-style crosstab Excel files. It generates branded charts, data tables, slide titles, question/base text, and row-based callouts — with an updater that refreshes those objects from new data without breaking formatting.
 
 ## Features
 
-- **Excel Parsing**: Intelligently parses Q-style crosstab Excel files
-- **PowerPoint Export**: Creates new presentations with branded charts and tables
-- **Deck Updates**: Updates existing presentations while preserving formatting
-- **Flexible Mapping**: Both automatic and manual mapping systems
-- **Multiple Chart Types**: Bar, Donut, Line, and Chart+Table options
+- **Excel Parsing**: Parses Q-style crosstab Excel workbooks, detecting table blocks, banners, metrics, and footnotes
+- **PowerPoint Export**: Creates new presentations with branded charts, tables, titles, and annotations
+- **Deck Updates**: Updates existing presentations with new data while preserving formatting
+- **Column Selection**: Choose which data column (e.g., "Total", "2024", a specific banner segment) to visualize per table
+- **Row-Based Callouts**: Create callouts tied to specific rows with customizable text and a `[Value]` placeholder
+- **Toggle-Based Callout UI**: Clean toggle controls for managing callouts per table, with persistence and "Previously:" labels for existing callouts
+- **Flexible Mapping**: Alt-text-based mapping system with both automatic (new reports) and manual (existing reports) workflows
+- **Multiple Chart Types**: Horizontal Bar, Vertical Bar, Stacked Bar, Donut, Line, Pie, and Chart+Table combos
 
 ## Installation
 
@@ -20,101 +23,76 @@ A Streamlit application that exports new PowerPoint reports from crosstab Excel 
 
 ## Usage
 
-### Basic Usage
-
-1. Run the Streamlit app:
-   ```bash
-   streamlit run app.py
-   ```
-
-2. Upload a crosstab Excel file
-3. Choose between exporting a new PowerPoint or updating an existing one
-4. Configure chart types, titles, and base text for each table
-5. Export or update your presentation
-
-### Enhanced Mapping System
-
-The application now supports both automatic and manual mapping, making it easy to retroactively map existing PowerPoint files.
-
-#### Automatic Mapping (New Reports)
-
-When you create new reports through the tool, shapes are automatically tagged with:
-- **Alt Text**: Detailed mapping information stored in PowerPoint's alternative text field
-- **XML Integration**: Uses PowerPoint's native XML structure for reliable alt text storage
-
-#### Manual Mapping (Existing Reports)
-
-For existing PowerPoint files, you can manually create mappings using the `mapping_helper.py` script:
-
-##### Step 1: Generate a Mapping Template
+### Running the App
 
 ```bash
-python mapping_helper.py template your_presentation.pptx your_crosstab.xlsx
+streamlit run app.py
 ```
 
-This creates a `mapping_template.py` file that looks like:
+### Workflow 1: Create a New Report
 
-```python
-# PowerPoint Mapping Template
+1. Upload a crosstab Excel file
+2. Configure each table: chart type, data column, metric, title, base text, question, row sorting, and callouts
+3. Export a new `.pptx` — all shapes are automatically tagged with mapping metadata
 
-# Instructions:
-# 1. Edit the mapping values below
-# 2. Save this file
-# 3. Use the apply_mapping function to update your PowerPoint
+### Workflow 2: Update an Existing Report
 
-# Available crosstab tables:
-# - Q Age (columns: 18-24, 25-34, 35-44, 45-54, 55+, Total)
-# - Q Gender (columns: Male, Female, Total)
+1. Upload an existing `.pptx` (with mapping metadata in alt text)
+2. Review detected connections (charts, tables, text, callouts)
+3. Upload a new crosstab Excel file
+4. The tool refreshes all mapped shapes with fresh data, preserving formatting
+5. Unmapped tables are listed on a summary slide
 
-MAPPINGS = {
-    # Slide 1, Shape 1: Chart1
-    'Chart1': {
-        'type': 'chart',
-        'table_title': 'Q Age',
-        'column': 'Total',  # or specific column name
-        'exclude_rows': 'base, mean, average, avg',
-        'auto_update': 'yes'
-    },
+### Column Selection
 
-    # Slide 1, Shape 2: Table1
-    'Table1': {
-        'type': 'table', 
-        'table_title': 'Q Age',
-        'columns': '*',
-        'exclude_rows': 'base, mean, average, avg',
-        'auto_update': 'yes'
-    },
-}
+Each table has a "Data column" dropdown. The selected column drives:
+- Chart data
+- Base N values
+- Callout values
+- Table data display
+
+### Row-Based Callouts
+
+1. **Enable**: Check "Enable callouts for this table"
+2. **Select row and column**: Pick which data point the callout references
+3. **Customize text**: Edit the text box; use `[Value]` as a placeholder for the actual data value
+4. **Examples**:
+   - `Gen Z: [Value]` renders as `Gen Z: 20.2%`
+   - `Millennials represent [Value] of respondents` renders as `Millennials represent 15.2% of respondents`
+
+When updating an existing deck, previously set callouts display a "Previously:" label showing the old text for context.
+
+## Mapping System
+
+Shapes are connected to crosstab data via alt-text metadata stored on each PowerPoint shape. When a report is created, `pptx_exporter.py` tags each shape automatically. When updating, `deck_update.py` reads these tags to match shapes to the correct table and column.
+
+### Automatic Mapping (New Reports)
+
+Shapes are tagged automatically during export with alt text like:
+
+```
+type=chart; table_title=Q Age; column=Total; exclude_rows=NET
 ```
 
-##### Step 2: Edit the Mapping
+### Manual Mapping (Existing Reports)
 
-Modify the `table_title` and `column` values to match your crosstab data. The `table_title` should exactly match one of the table titles from your Excel file.
-
-##### Step 3: Apply the Mapping
+For existing PowerPoint files, use `mapping_helper.py`:
 
 ```bash
-python mapping_helper.py apply your_presentation.pptx mapping_template.py
+# List all shapes and their mapping status
+python mapping_helper.py list presentation.pptx
+
+# Generate an editable mapping template
+python mapping_helper.py template presentation.pptx crosstab.xlsx
+
+# Apply mappings from a template file
+python mapping_helper.py apply presentation.pptx mapping_template.py
+
+# Validate mappings against crosstab data
+python mapping_helper.py validate presentation.pptx crosstab.xlsx
 ```
 
-This updates your PowerPoint file with the new mappings (saved as `your_presentation_mapped.pptx`).
-
-##### Step 4: Validate Mappings
-
-```bash
-python mapping_helper.py validate your_presentation_mapped.pptx your_crosstab.xlsx
-```
-
-This checks that all your mappings are valid and points out any issues.
-
-#### Manual Mapping in PowerPoint
-
-You can also create mappings directly in PowerPoint:
-
-1. **Right-click** on a chart or table shape
-2. **Select "Format Shape"**
-3. **Go to "Alt Text" tab**
-4. **In the Description field, add your mapping:**
+You can also map shapes directly in PowerPoint: right-click a shape, open **Format Shape > Alt Text**, and add mapping fields in the Description box:
 
 ```
 type: chart
@@ -124,90 +102,39 @@ exclude_rows: base, mean, average, avg
 auto_update: yes
 ```
 
-**Note**: The tool automatically sets alt text for new reports. For existing reports, you can manually add these mappings in PowerPoint, and the tool will read them during updates.
+### Mapping Options
 
-### Mapping Helper Commands
+| Shape Type | Fields |
+|---|---|
+| **Chart** | `type: chart`, `table_title`, `column`, `exclude_rows`, `auto_update` |
+| **Table** | `type: table`, `table_title`, `columns` (`*` for all), `exclude_rows`, `auto_update` |
+| **Question text** | `type: text_question`, `auto_update` |
+| **Base text** | `type: text_base`, `auto_update` |
+| **Title text** | `type: text_title`, `auto_update` |
+| **Callout** | `type: text_callout`, `table_title`, `row_label`, `column_key`, `auto_update` |
 
-```bash
-# List all shapes in a PowerPoint file
-python mapping_helper.py list presentation.pptx
-
-# Generate mapping template
-python mapping_helper.py template presentation.pptx crosstab.xlsx
-
-# Apply mappings from file
-python mapping_helper.py apply presentation.pptx mapping_template.py
-
-# Validate existing mappings
-python mapping_helper.py validate presentation.pptx crosstab.xlsx
-```
-
-## Mapping Configuration Options
-
-### For Charts
-- `type`: Must be "chart"
-- `table_title`: The exact title of the crosstab table
-- `column`: Which column to chart (e.g., "Total", "Male", "18-24")
-- `exclude_rows`: Rows to exclude (default: "base, mean, average, avg")
-- `auto_update`: Set to "no" to skip automatic updates
-
-### For Tables
-- `type`: Must be "table"
-- `table_title`: The exact title of the crosstab table
-- `columns`: Which columns to include (use "*" for all)
-- `exclude_rows`: Rows to exclude
-- `auto_update`: Set to "no" to skip automatic updates
-
-### For Text Objects
-- `type`: "question_text" or "base_text"
-- `auto_update`: Set to "no" to skip automatic updates
+Set `auto_update: no` on any shape to skip it during updates.
 
 ## File Structure
 
-- `app.py` - Main Streamlit application
-- `crosstab_parser.py` - Excel file parser
-- `pptx_exporter.py` - PowerPoint creation and export
-- `deck_update.py` - PowerPoint update functionality
-- `mapping_helper.py` - Manual mapping assistance
-- `requirements.txt` - Python dependencies
+```
+app.py                 — Streamlit UI (main entry point)
+crosstab_parser.py     — Excel crosstab parser
+pptx_exporter.py       — PowerPoint creation and export
+deck_update.py         — PowerPoint update logic
+mapping_helper.py      — CLI for mapping management
+requirements.txt       — Python dependencies
+README.md              — This file
+```
+
+### Test Data
+
+- `Test Crosstab - Smaller - V1.xlsx` — Sample crosstab for testing
+- `Test Crosstab - Smaller - V2.xlsx` — Alternate sample crosstab for testing updates
 
 ## Troubleshooting
 
-### Common Issues
-
-1. **Font Not Found**: The app now uses Arial as a fallback font
-2. **Mapping Not Working**: Use the validation command to check for issues
-3. **Shape Names**: Ensure shapes have descriptive names for easier mapping
-
-### Debugging
-
-- Use `python mapping_helper.py list` to see all shapes and their mapping status
-- Check the console output during updates for detailed logging
-- Validate mappings before running updates
-
-## Advanced Features
-
-### Custom Row Selection
-
-You can specify which rows to include in charts by modifying the `exclude_rows` field:
-
-```
-exclude_rows: base, mean, average, avg, other_unwanted_rows
-```
-
-### Binding Question and Base Text
-
-Charts can automatically update question and base text by setting:
-
-```
-bind_question: TEXT_QUESTION
-bind_base: TEXT_BASE
-```
-
-### Skipping Updates
-
-Set `auto_update: no` to prevent a shape from being automatically updated.
-
-## Contributing
-
-Feel free to submit issues and enhancement requests. The mapping system is designed to be extensible for additional mapping types and configurations.
+- **Font Not Found**: The app uses Arial as a fallback font
+- **Mapping Not Working**: Run `python mapping_helper.py validate` to diagnose issues
+- **Shape Names**: Use `python mapping_helper.py list` to see all shapes and their mapping status
+- **Console Logging**: Check terminal output during updates for detailed diagnostics

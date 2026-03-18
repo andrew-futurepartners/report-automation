@@ -64,17 +64,44 @@ def parse_workbook(path: str) -> Dict[str, Any]:
             if sub.shape[0] < 2 or sub.shape[1] < 2:
                 continue
 
-            # Find header row: first row that has at least 2 non-null values
-            header_row_idx = None
-            for r in range(min(5, sub.shape[0])):
-                if sub.iloc[r].notna().sum() >= 2:
-                    header_row_idx = r
-                    break
-            if header_row_idx is None:
-                header_row_idx = 0
+            # Detect header structure (one-row vs two-row: Metric row + Banner row)
+            # Strategy: within first 5 rows, choose banner row as the row with max
+            # non-null cells; if the row above has significantly fewer values, treat it
+            # as a metric row and forward-fill its labels.
+            lookahead = min(5, sub.shape[0])
+            nn_counts = [int(sub.iloc[r].notna().sum()) for r in range(lookahead)]
+            if nn_counts:
+                banner_row_idx = int(max(range(len(nn_counts)), key=lambda i: nn_counts[i]))
+            else:
+                banner_row_idx = 0
 
-            header = sub.iloc[header_row_idx].fillna("").astype(str).tolist()
-            body = sub.iloc[header_row_idx+1:].reset_index(drop=True)
+            metric_row_idx: Optional[int] = None
+            if banner_row_idx > 0:
+                above_count = nn_counts[banner_row_idx - 1]
+                banner_count = nn_counts[banner_row_idx]
+                # Treat the row above as a metric row only if it looks like a
+                # true header (not a single-cell question line): require >=2
+                # non-empty cells and not almost as dense as the banner row.
+                if above_count >= 2 and above_count <= max(2, int(banner_count * 0.8)):
+                    metric_row_idx = banner_row_idx - 1
+
+            # Build header labels
+            banner_row = sub.iloc[banner_row_idx].fillna("").astype(str).tolist()
+            if metric_row_idx is not None:
+                raw_metric_row = sub.iloc[metric_row_idx].astype(str).tolist()
+                # Forward-fill across columns to simulate Excel merged cells
+                metric_row_ff = []
+                last = ""
+                for cell in raw_metric_row:
+                    c = "" if cell is None or str(cell).strip() == "nan" else str(cell)
+                    if c.strip():
+                        last = c
+                    metric_row_ff.append(last)
+            else:
+                metric_row_ff = [""] * len(banner_row)
+
+            # Body starts after the banner row
+            body = sub.iloc[banner_row_idx+1:].reset_index(drop=True)
 
             # First column are row labels
             row_labels_raw = body.iloc[:,0].fillna("").astype(str).tolist()
@@ -83,14 +110,11 @@ def parse_workbook(path: str) -> Dict[str, Any]:
             # Filter out footnote rows - these typically contain text patterns like:
             # "Total sample", "Multiple comparison", "base n =", "Unweighted", etc.
             footnote_patterns = [
-                "total sample", "unweighted", "weighted", "base n =", "base:", "n =",
+                "total sample", "unweighted", "weighted", "base n =", "n =",
                 "multiple comparison", "false discovery rate", "fdr", "p =", "p<", "p>",
                 "significance", "statistical", "confidence", "margin of error",
                 "fieldwork", "survey", "methodology", "data collection"
             ]
-            
-            # Additional check for standalone "Base" rows that are likely footnotes
-            base_only_patterns = ["base"]
             
             # Identify rows to keep (exclude footnotes)
             rows_to_keep = []
@@ -108,16 +132,6 @@ def parse_workbook(path: str) -> Dict[str, Any]:
                         is_footnote = True
                         break
                 
-                # Check for standalone "Base" rows (common footnote pattern)
-                if not is_footnote and label_lower in base_only_patterns:
-                    # Check if this Base row has data that looks like sample sizes (>100)
-                    row_data = data_part_raw.iloc[i]
-                    non_null_values = row_data.dropna()
-                    if len(non_null_values) > 0:
-                        # If most values are large numbers (>100), likely sample sizes = footnote
-                        large_values = sum(1 for val in non_null_values if val > 100)
-                        if large_values / len(non_null_values) > 0.5:
-                            is_footnote = True
                 
                 # Also check if the row has mostly NaN values (typical of footnote rows)
                 if not is_footnote:
@@ -142,11 +156,22 @@ def parse_workbook(path: str) -> Dict[str, Any]:
             
             # Replace NaN values with None to avoid chart errors
             data_part = data_part.where(pd.notna(data_part), None)
-            col_labels = header[1:len(data_part.columns)+1]
+            # Column label construction
+            # Always expose flat col_labels for downstream (optionally combined "Banner | Metric")
+            col_banners = [str(b).strip() for b in banner_row[1:len(data_part.columns)+1]]
+            col_groups = metric_row_ff[1:len(data_part.columns)+1]
+            # Normalize blanks
+            col_groups = [g.strip() if isinstance(g, str) and g.strip() != "" else "" for g in col_groups]
+            # Combined labels for unique identification (Banner | Metric)
+            col_labels = [
+                (f"{b} | {g}" if g else str(b))
+                for g, b in zip(col_groups, col_banners)
+            ]
 
-            # Title guess: the first non-empty cell above header row, else sheet name + index
+            # Title guess: first non-empty cell above the header area (metric row if present, else banner row)
             title = None
-            for r in range(header_row_idx):
+            top_header_idx = metric_row_idx if metric_row_idx is not None else banner_row_idx
+            for r in range(int(top_header_idx)):
                 row_vals = sub.iloc[r].dropna().astype(str).tolist()
                 if row_vals:
                     title = row_vals[0]
@@ -163,7 +188,12 @@ def parse_workbook(path: str) -> Dict[str, Any]:
                 "row_labels": row_labels,
                 "col_labels": col_labels,
                 "values": data_part.values.tolist(),
-                "meta": {"block_start": int(st), "block_end": int(en)}
+                "meta": {
+                    "block_start": int(st),
+                    "block_end": int(en),
+                    "col_banners": col_banners,
+                    "col_groups": col_groups
+                }
             }
             tables.append(tdict)
 

@@ -55,11 +55,32 @@ def _parse_alt_text(shape) -> Dict[str, str]:
             out[_norm(k)] = v.strip()
     return out
 
-def _exclude_indices(labels: List[str]) -> set:
+def _exclude_indices(labels: List[str], extra_excludes: Optional[List[str]] = None) -> set:
+    """Return indices to exclude based on default prefixes and optional explicit names.
+    Matching is case-insensitive; explicit names match either full equality or prefix.
+    """
     ex = set()
+    extra_norm = []
+    if extra_excludes:
+        for it in extra_excludes:
+            if it is None:
+                continue
+            s = _norm(str(it))
+            if s:
+                extra_norm.append(s)
     for i, lab in enumerate(labels):
-        if isinstance(lab, str) and _norm(lab).startswith(EXCLUDE_PREFIXES):
+        if not isinstance(lab, str):
+            continue
+        nlab = _norm(lab)
+        if nlab.startswith(EXCLUDE_PREFIXES):
             ex.add(i)
+            continue
+        for pat in extra_norm:
+            if not pat:
+                continue
+            if nlab == pat or nlab.startswith(pat):
+                ex.add(i)
+                break
     return ex
 
 def _row_index_map(labels: List[str]) -> Dict[str, int]:
@@ -107,10 +128,10 @@ def _series_from_table(table: Dict[str, Any], col_idx: Optional[int], exclude_ro
             vals.append(val)
     return cats, vals
 
-def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit_rows: Optional[List[str]]):
+def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit_rows: Optional[List[str]], exclude_terms: Optional[List[str]] = None):
     chart = shape.chart
     col_idx = _choose_col_idx(table["col_labels"], col_key)
-    ex = _exclude_indices(table["row_labels"])
+    ex = _exclude_indices(table["row_labels"], exclude_terms)
 
     if explicit_rows:
         idx_map = _row_index_map(table["row_labels"])
@@ -128,8 +149,10 @@ def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit
     else:
         cats, vals = _series_from_table(table, col_idx, ex)
 
-    # Store current chart formatting before updating data
+    # Store current chart formatting before updating data (to preserve label/axis formats)
     chart_formatting = {}
+    series_formats = []
+    plot_labels_fmt = {}
     try:
         # Store chart type
         chart_formatting['chart_type'] = chart.chart_type
@@ -149,9 +172,107 @@ def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit
             chart_area = chart.chart_area
             if hasattr(chart_area, 'format'):
                 chart_formatting['chart_area_format'] = chart_area.format
+
+        # Store plot-level data label settings (some charts use plot labels only)
+        try:
+            plots = getattr(chart, 'plots', None)
+            if plots and len(plots) > 0 and hasattr(plots[0], 'data_labels'):
+                pdl = plots[0].data_labels
+                plot_labels_fmt['exists'] = True
+                try:
+                    plot_labels_fmt['show_value'] = pdl.show_value
+                except Exception:
+                    plot_labels_fmt['show_value'] = None
+                try:
+                    plot_labels_fmt['number_format'] = pdl.number_format
+                except Exception:
+                    plot_labels_fmt['number_format'] = None
+                try:
+                    plot_labels_fmt['number_format_is_linked'] = pdl.number_format_is_linked
+                except Exception:
+                    plot_labels_fmt['number_format_is_linked'] = None
+                try:
+                    plot_labels_fmt['position'] = pdl.position
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Store per-series data label settings
+        for s in chart.series:
+            fmt = {}
+            try:
+                dl = s.data_labels
+                fmt['show_value'] = getattr(dl, 'show_value', None)
+                # number_format may raise if not supported on this chart type
+                try:
+                    fmt['number_format'] = dl.number_format
+                except Exception:
+                    fmt['number_format'] = None
+                try:
+                    fmt['number_format_is_linked'] = dl.number_format_is_linked
+                except Exception:
+                    fmt['number_format_is_linked'] = None
+                # Per-point formats (some decks set label formats on points)
+                point_formats = []
+                try:
+                    for pt in getattr(s, 'points', []):
+                        pf = {}
+                        try:
+                            pf['number_format'] = pt.data_label.number_format
+                        except Exception:
+                            pf['number_format'] = None
+                        try:
+                            pf['number_format_is_linked'] = pt.data_label.number_format_is_linked
+                        except Exception:
+                            pf['number_format_is_linked'] = None
+                        point_formats.append(pf)
+                except Exception:
+                    pass
+                fmt['point_formats'] = point_formats
+                try:
+                    fmt['position'] = dl.position
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            series_formats.append(fmt)
+
+        # Store axis tick label formats
+        try:
+            if hasattr(chart, 'value_axis') and hasattr(chart.value_axis, 'tick_labels'):
+                chart_formatting['value_axis_number_format'] = chart.value_axis.tick_labels.number_format
+                try:
+                    chart_formatting['value_axis_number_format_is_linked'] = chart.value_axis.tick_labels.number_format_is_linked
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if hasattr(chart, 'category_axis') and hasattr(chart.category_axis, 'tick_labels'):
+                chart_formatting['category_axis_number_format'] = chart.category_axis.tick_labels.number_format
+                try:
+                    chart_formatting['category_axis_number_format_is_linked'] = chart.category_axis.tick_labels.number_format_is_linked
+                except Exception:
+                    pass
+        except Exception:
+            pass
                 
     except Exception as e:
         print(f"Warning: Could not preserve all chart formatting: {e}")
+
+    # Determine if values look like proportions (0..1) to enforce % formatting if needed
+    def _looks_percent(values_list):
+        try:
+            numeric = [float(v) for v in values_list if v is not None]
+            if not numeric:
+                return False
+            mn, mx = min(numeric), max(numeric)
+            return 0.0 <= mn <= 1.0 and 0.0 <= mx <= 1.1 and mx >= 0.05
+        except Exception:
+            return False
+    series_values_snapshot = [list(vals)]  # single-series for now
+    looks_percent_flags = [_looks_percent(vals)]
 
     # Update the chart data
     cd = ChartData()
@@ -168,6 +289,130 @@ def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit
         # Restore chart style if it was changed
         if 'chart_style' in chart_formatting:
             chart.chart_style = chart_formatting['chart_style']
+        
+        # Re-apply per-series data label formats
+        if series_formats:
+            for i, s in enumerate(chart.series):
+                fmt = series_formats[min(i, len(series_formats)-1)]
+                try:
+                    dl = s.data_labels
+                    if 'show_value' in fmt and fmt['show_value'] is not None:
+                        dl.show_value = fmt['show_value']
+                    if 'number_format' in fmt and fmt['number_format']:
+                        try:
+                            if hasattr(dl, 'number_format_is_linked'):
+                                dl.number_format_is_linked = False
+                        except Exception:
+                            pass
+                        dl.number_format = fmt['number_format']
+                    elif 'number_format' in fmt and not fmt['number_format']:
+                        # Fallback: apply axis format if it looks percent-like
+                        ax_fmt = chart_formatting.get('value_axis_number_format') or chart_formatting.get('category_axis_number_format')
+                        if isinstance(ax_fmt, str) and '%' in ax_fmt:
+                            try:
+                                if hasattr(dl, 'number_format_is_linked'):
+                                    dl.number_format_is_linked = False
+                            except Exception:
+                                pass
+                            dl.number_format = ax_fmt
+                    # Final fallback: enforce % if series values look like proportions
+                    if looks_percent_flags[min(i, len(looks_percent_flags)-1)]:
+                        try:
+                            current_fmt = None
+                            try:
+                                current_fmt = dl.number_format
+                            except Exception:
+                                current_fmt = None
+                            if not (isinstance(current_fmt, str) and '%' in current_fmt):
+                                if hasattr(dl, 'number_format_is_linked'):
+                                    dl.number_format_is_linked = False
+                                dl.number_format = "0.0%"
+                        except Exception:
+                            pass
+                    if 'position' in fmt and fmt['position'] is not None:
+                        try:
+                            dl.position = fmt['position']
+                        except Exception:
+                            pass
+                    # Re-apply per-point formats if available
+                    pts = getattr(s, 'points', [])
+                    point_formats = fmt.get('point_formats') or []
+                    for j, pt in enumerate(pts):
+                        pf = point_formats[min(j, len(point_formats)-1)] if point_formats else {}
+                        try:
+                            if pf.get('number_format'):
+                                if hasattr(pt.data_label, 'number_format_is_linked'):
+                                    pt.data_label.number_format_is_linked = False
+                                pt.data_label.number_format = pf['number_format']
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+        # Re-apply plot-level label formats (or enforce % if needed)
+        try:
+            plots = getattr(chart, 'plots', None)
+            if plots and len(plots) > 0 and hasattr(plots[0], 'data_labels'):
+                pdl = plots[0].data_labels
+                fmt = plot_labels_fmt
+                # If original had explicit fmt, reapply
+                if fmt.get('exists'):
+                    try:
+                        if fmt.get('show_value') is not None:
+                            pdl.show_value = fmt['show_value']
+                    except Exception:
+                        pass
+                    try:
+                        if fmt.get('number_format'):
+                            if hasattr(pdl, 'number_format_is_linked'):
+                                pdl.number_format_is_linked = False
+                            pdl.number_format = fmt['number_format']
+                    except Exception:
+                        pass
+                    try:
+                        if fmt.get('position') is not None:
+                            pdl.position = fmt['position']
+                    except Exception:
+                        pass
+                # Final fallback: enforce percent at plot level when values look like proportions
+                if looks_percent_flags and looks_percent_flags[0]:
+                    try:
+                        curr = None
+                        try:
+                            curr = pdl.number_format
+                        except Exception:
+                            curr = None
+                        if not (isinstance(curr, str) and '%' in curr):
+                            if hasattr(pdl, 'number_format_is_linked'):
+                                pdl.number_format_is_linked = False
+                            pdl.number_format = "0.0%"
+                            pdl.show_value = True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Restore axis tick label formats (e.g., percentages)
+        try:
+            if 'value_axis_number_format' in chart_formatting and hasattr(chart, 'value_axis') and hasattr(chart.value_axis, 'tick_labels'):
+                try:
+                    if 'value_axis_number_format_is_linked' in chart_formatting and hasattr(chart.value_axis.tick_labels, 'number_format_is_linked'):
+                        chart.value_axis.tick_labels.number_format_is_linked = False
+                except Exception:
+                    pass
+                chart.value_axis.tick_labels.number_format = chart_formatting['value_axis_number_format']
+        except Exception:
+            pass
+        try:
+            if 'category_axis_number_format' in chart_formatting and hasattr(chart, 'category_axis') and hasattr(chart.category_axis, 'tick_labels'):
+                try:
+                    if 'category_axis_number_format_is_linked' in chart_formatting and hasattr(chart.category_axis.tick_labels, 'number_format_is_linked'):
+                        chart.category_axis.tick_labels.number_format_is_linked = False
+                except Exception:
+                    pass
+                chart.category_axis.tick_labels.number_format = chart_formatting['category_axis_number_format']
+        except Exception:
+            pass
             
     except Exception as e:
         print(f"Warning: Could not restore all chart formatting: {e}")
@@ -283,11 +528,11 @@ def _get_table_mapping_from_shape(shape, data: Dict[str, Any]) -> Optional[Dict[
     
     return None
 
-def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optional[Dict[str, Any]] = None) -> Optional[Tuple[Dict[str, Any], Optional[str]]]:
+def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optional[Dict[str, Any]] = None) -> Optional[Tuple[Dict[str, Any], Optional[str], Optional[List[str]]]]:
     """Enhanced chart mapping that handles both automatic and manual configurations."""
     name = shape.name or ""
     alt = _parse_alt_text(shape)
-    
+    exclude_terms: Optional[List[str]] = None
     table = None
     col_key = None
     
@@ -295,6 +540,9 @@ def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optio
     if "table_title" in alt:
         table_title = alt["table_title"]
         col_key = alt.get("column")
+        # Parse optional exclude_rows: comma-separated list
+        if 'exclude_rows' in alt and isinstance(alt['exclude_rows'], str):
+            exclude_terms = [p.strip() for p in alt['exclude_rows'].split(',')]
         
         # Find matching table
         for t in data["tables"]:
@@ -351,7 +599,7 @@ def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optio
         if "column_key" in selection:
             col_key = selection["column_key"]
     
-    return (table, col_key) if table else None
+    return (table, col_key, exclude_terms) if table else None
 
 def _format_number_with_commas(number):
     """Format a number with comma separators for thousands places."""
@@ -365,8 +613,8 @@ def _update_question_and_base(slide, table: Dict[str, Any], col_key: Optional[st
     for shape in slide.shapes:
         alt = _parse_alt_text(shape)
         
-        # Update question text
-        if alt.get("type") == "question_text" and alt.get("table_title") == table.get("title"):
+        # Update question text (support both legacy 'question_text' and 'text_question')
+        if alt.get("type") in ["question_text", "text_question"] and alt.get("table_title") == table.get("title"):
             if hasattr(shape, "text_frame"):
                 # Preserve existing custom question text if it's different from the table title
                 current_text = shape.text_frame.text
@@ -515,8 +763,8 @@ def _update_question_and_base_with_selections(slide, table: Dict[str, Any], sele
     for shape in slide.shapes:
         alt = _parse_alt_text(shape)
         
-        # Update question text
-        if alt.get("type") == "question_text" and alt.get("table_title") == table_title:
+        # Update question text (support both legacy 'question_text' and 'text_question')
+        if alt.get("type") in ["question_text", "text_question"] and alt.get("table_title") == table_title:
             shape_count += 1
             print(f"DEBUG: Found question_text shape #{shape_count} for table: {table_title}")
             if hasattr(shape, "text_frame"):
@@ -751,8 +999,9 @@ def _update_new_text_callout_system(slide, table: Dict[str, Any], col_key: Optio
         if alt.get("type") == "text_callout" and alt.get("table_title") == table.get("title"):
             if hasattr(shape, "text_frame"):
                 # Get callout information from alt text
-                row_label = alt.get("row_label", "")
+                row_label = alt.get("row", alt.get("row_label", ""))
                 column = alt.get("column", "Total")
+                metric_type = alt.get("metric_type", "percentage")
                 
                 # Get the current text from the shape to see if it has custom formatting
                 current_shape_text = shape.text_frame.text if hasattr(shape, "text_frame") else ""
@@ -792,25 +1041,36 @@ def _update_new_text_callout_system(slide, table: Dict[str, Any], col_key: Optio
                                     # Format the value appropriately
                                     formatted_value = ""
                                     if isinstance(value, (int, float)):
-                                        if hasattr(value, 'is_integer') and value.is_integer():
-                                            formatted_value = str(int(value))
+                                        mt = (metric_type or "").lower()
+                                        if mt == "percentage":
+                                            formatted_value = f"{float(value) * 100:.1f}%"
+                                        elif mt == "currency":
+                                            formatted_value = f"${float(value):,.0f}"
                                         else:
-                                            formatted_value = f"{value:.1f}%"
+                                            formatted_value = f"{float(value):,.1f}"
                                     else:
                                         formatted_value = str(value)
                                     
-                                    # Check if the current text has custom formatting with [Value] placeholder
+                                    # If textbox has [Value], do direct replacement
                                     if current_shape_text and "[Value]" in current_shape_text:
                                         new_text = current_shape_text.replace("[Value]", formatted_value)
+                                    elif current_shape_text:
+                                        # Try intelligent in-place replacement of first numeric token
+                                        import re
+                                        pattern = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?")
+                                        if pattern.search(current_shape_text):
+                                            new_text = pattern.sub(formatted_value, current_shape_text, count=1)
+                                        else:
+                                            # Fallback to prefixing with row label
+                                            new_text = f"{row_label}: {formatted_value}"
                                     else:
-                                        # Use default format
                                         new_text = f"{row_label}: {formatted_value}"
                         except (IndexError, TypeError, AttributeError):
                             pass
                 
                 # If no custom formatting found, use default
                 if not new_text:
-                    new_text = f"{row_label}: [Value]"
+                    new_text = current_shape_text if current_shape_text else f"{row_label}: [Value]"
                 
                 # Update the text while preserving formatting
                 current_text = shape.text_frame.text
@@ -865,8 +1125,8 @@ def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selecti
                 # If we get here, the shape contains a chart
                 chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
                 if chart_mapping:
-                    table, col_key = chart_mapping
-                    _update_chart(shp, table, col_key, explicit_rows=None)
+                    table, col_key, exclude_terms = chart_mapping
+                    _update_chart(shp, table, col_key, explicit_rows=None, exclude_terms=exclude_terms)
                     
                     # Update question and base text for this table using current selections if available
                     if selections:
@@ -1017,8 +1277,8 @@ def update_presentation_with_unmapped(pptx_in: str, crosstab_xlsx: str, pptx_out
                 # If we get here, the shape contains a chart
                 chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
                 if chart_mapping:
-                    table, col_key = chart_mapping
-                    _update_chart(shp, table, col_key, explicit_rows=None)
+                    table, col_key, exclude_terms = chart_mapping
+                    _update_chart(shp, table, col_key, explicit_rows=None, exclude_terms=exclude_terms)
                     
                     # Update question and base text for this table using current selections if available
                     if selections:

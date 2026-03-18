@@ -40,6 +40,7 @@ class TextCallout:
     font_size: int = 12
     font_bold: bool = True
     font_color: Optional[RGBColor] = None
+    metric_type: str = "percentage"    # percentage | number | currency
     
     # Metadata for mapping
     bind_question: str = "TEXT_QUESTION"
@@ -65,19 +66,24 @@ class TextCallout:
                         # Format the value appropriately
                         formatted_value = ""
                         if isinstance(value, (int, float)):
-                            if hasattr(value, 'is_integer') and value.is_integer():
-                                formatted_value = str(int(value))
+                            if (self.metric_type or "").lower() == "percentage":
+                                formatted_value = f"{float(value) * 100:.1f}%"
+                            elif (self.metric_type or "").lower() == "currency":
+                                formatted_value = f"${float(value):,.0f}"
                             else:
-                                formatted_value = f"{value:.1f}%"
+                                # number
+                                formatted_value = f"{float(value):,.1f}"
                         else:
                             formatted_value = str(value)
                         
                         # Replace [Value] placeholder with actual value in custom text
                         if self.text and "[Value]" in self.text:
                             return self.text.replace("[Value]", formatted_value)
-                        else:
-                            # Fallback to default format if no custom text or no [Value] placeholder
-                            return f"{self.row_label}: {formatted_value}"
+                        # If user provided custom text without placeholder, respect it
+                        if self.text:
+                            return self.text
+                        # Default
+                        return f"{self.row_label}: {formatted_value}"
                 except (IndexError, TypeError):
                     pass
         
@@ -111,9 +117,8 @@ class TextCallout:
             "type": "text_callout",
             "table_title": self.table_title,
             "column": self.column_key,
-            "row_label": self.row_label,
-            "bind_question": self.bind_question,
-            "bind_base": self.bind_base,
+            "row": self.row_label,
+            "metric_type": self.metric_type,
             "auto_update": "yes" if self.auto_update else "no"
         }
 
@@ -144,7 +149,7 @@ def add_question_text(slide, question_text, table_title, position=(0.5, 1.0, 9.0
     qb = slide.shapes.add_textbox(x, y, w, h)
     
     # Set alt text for mapping using _tag_shape
-    _tag_shape(qb, "question_text", table_title, "Total")
+    _tag_shape(qb, "text_question", table_title, "Total")
     
     # Set the text content
     tf = qb.text_frame
@@ -164,7 +169,7 @@ def add_text_callout(slide, callout: TextCallout, table_data: Optional[Dict[str,
     
     # Set alt text for mapping using _tag_shape
     _tag_shape(callout_box, "text_callout", callout.table_title, callout.column_key, 
-               callout.bind_question, callout.bind_base, callout.row_label)
+               callout.bind_question, callout.bind_base, callout.row_label, callout.metric_type)
     
     # Set the text content
     tf = callout_box.text_frame
@@ -258,7 +263,7 @@ def _set_alt_text(shape, mapping: dict):
         pass
 
 def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = None,
-               bind_question: str = "TEXT_QUESTION", bind_base: str = "TEXT_BASE", row_label: str | None = None):
+               bind_question: str = "TEXT_QUESTION", bind_base: str = "TEXT_BASE", row_label: str | None = None, metric_type: str | None = None):
     """Tag shapes with alt text only - no shape naming."""
     
     if obj_type == "chart":
@@ -267,8 +272,6 @@ def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = Non
             "table_title": table_title,
             "column": col_key or "Total",
             "exclude_rows": "base, mean, average, avg",
-            "bind_question": bind_question,
-            "bind_base": bind_base,
             "auto_update": "yes"
         })
         
@@ -282,9 +285,9 @@ def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = Non
             "auto_update": "yes"
         })
         
-    elif obj_type == "question_text":
+    elif obj_type in ["question_text", "text_question"]:
         _set_alt_text(shape, {
-            "type": "question_text",
+            "type": "text_question",
             "table_title": table_title,
             "column": col_key or "Total",  # Add column attribute
             "auto_update": "yes"
@@ -311,7 +314,8 @@ def _tag_shape(shape, obj_type: str, table_title: str, col_key: str | None = Non
             "type": "text_callout",
             "table_title": table_title,
             "column": col_key or "Total",
-            "row_label": row_label or "",
+            "row": row_label or "",
+            "metric_type": (metric_type or "percentage"),
             "auto_update": "yes"
         })
 
@@ -344,24 +348,91 @@ def _add_table(slide, col_labels: List[str], row_labels: List[str], values: List
 
     return table_shape
 
-def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None, question_text: str | None = None, callouts: List[TextCallout] | None = None):
+def sort_table_rows(table: Dict[str, Any], column_key: str = "Total", excluded_rows: List[str] = None) -> Dict[str, Any]:
+    """Sort table rows by values in descending order, keeping excluded rows at bottom."""
+    if excluded_rows is None:
+        excluded_rows = []
+    
+    # Create a copy to avoid modifying the original
+    sorted_table = table.copy()
+    row_labels = table["row_labels"].copy()
+    values = [row.copy() for row in table["values"]]
+    
+    # Find the column index to sort by
+    col_labels = table["col_labels"]
+    if column_key in col_labels:
+        sort_col_idx = col_labels.index(column_key)
+    elif "Total" in col_labels:
+        sort_col_idx = col_labels.index("Total")
+    else:
+        sort_col_idx = 0 if col_labels else None
+    
+    if sort_col_idx is None:
+        return sorted_table  # Can't sort without a valid column
+    
+    # Separate rows into sortable and excluded
+    sortable_data = []
+    excluded_data = []
+    
+    for i, (label, row) in enumerate(zip(row_labels, values)):
+        if label in excluded_rows:
+            excluded_data.append((label, row, i))
+        else:
+            # Get the value to sort by
+            sort_value = row[sort_col_idx] if sort_col_idx < len(row) and row[sort_col_idx] is not None else 0
+            sortable_data.append((label, row, i, sort_value))
+    
+    # Sort the sortable data by value (descending)
+    sortable_data.sort(key=lambda x: x[3], reverse=True)
+    
+    # Rebuild the table with sorted rows
+    new_row_labels = []
+    new_values = []
+    
+    # Add sorted rows first
+    for label, row, _, _ in sortable_data:
+        new_row_labels.append(label)
+        new_values.append(row)
+    
+    # Add excluded rows at the bottom
+    for label, row, _ in excluded_data:
+        new_row_labels.append(label)
+        new_values.append(row)
+    
+    # Update the sorted table
+    sorted_table["row_labels"] = new_row_labels
+    sorted_table["values"] = new_values
+    
+    return sorted_table
+
+def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", include_table=False, chart_title=None, base_text: str | None = None, question_text: str | None = None, callouts: List[TextCallout] | None = None, enable_sorting: bool = False, excluded_rows: List[str] = None, column_key: str | None = None):
     slide = prs.slides.add_slide(prs.slide_layouts[layout])
     _apply_background(slide)
     
+    # Apply row sorting if enabled
+    working_table = table
+    if enable_sorting:
+        # Determine which column to sort by
+        sort_column = "Total"  # Default sort column
+        if callouts and len(callouts) > 0:
+            # Use the column from the first callout if available
+            sort_column = callouts[0].column_key
+        working_table = sort_table_rows(table, sort_column, excluded_rows or [])
+    
     # Add title with alt text for mapping
-    title_to_use = chart_title or table["title"]
-    add_title(slide, title_to_use, table.get("title"))
+    title_to_use = chart_title or working_table["title"]
+    add_title(slide, title_to_use, working_table.get("title"))
     
     # Add question text if provided
     if question_text:
-        add_question_text(slide, question_text, table.get("title"), position=(0.5, 0.8, 9.0, 0.4))
+        add_question_text(slide, question_text, working_table.get("title"), position=(0.5, 0.8, 9.0, 0.4))
         chart_y_offset = 1.4  # Move chart down if question text is present
     else:
         chart_y_offset = 1.2  # Default chart position
 
     # Exclusions for charts
     base_row_idx = None
-    for i, rlab in enumerate(table["row_labels"]):
+    for i, rlab in enumerate(working_table["row_labels"]):
         if isinstance(rlab, str) and rlab.strip().lower().startswith("base"):
             base_row_idx = i
             break
@@ -369,26 +440,29 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
     exclude_indices = set()
     if base_row_idx is not None:
         exclude_indices.add(base_row_idx)
-    for i, rlab in enumerate(table["row_labels"]):
+    for i, rlab in enumerate(working_table["row_labels"]):
         if isinstance(rlab, str):
             lab = rlab.strip().lower()
             if lab.startswith("mean") or lab.startswith("average") or lab.startswith("avg"):
                 exclude_indices.add(i)
 
-    col_labels = table["col_labels"]
-    values = table["values"]
-    row_labels = table["row_labels"]
+    col_labels = working_table["col_labels"]
+    values = working_table["values"]
+    row_labels = working_table["row_labels"]
 
-    # Series, prefer Total
-    if "Total" in col_labels:
-        total_idx = col_labels.index("Total")
+    # Series to plot: use explicit column_key if provided, else prefer Total
+    selected_idx = None
+    if column_key and column_key in col_labels:
+        selected_idx = col_labels.index(column_key)
+    elif "Total" in col_labels:
+        selected_idx = col_labels.index("Total")
     else:
-        total_idx = 0 if col_labels else None
+        selected_idx = 0 if col_labels else None
 
     # Chart data arrays
-    if total_idx is not None:
+    if selected_idx is not None:
         categories = [lab for i, lab in enumerate(row_labels) if i not in exclude_indices]
-        series_values = [row[total_idx] if total_idx < len(row) else None for i, row in enumerate(values) if i not in exclude_indices]
+        series_values = [row[selected_idx] if selected_idx < len(row) else None for i, row in enumerate(values) if i not in exclude_indices]
     else:
         categories = [lab for i, lab in enumerate(row_labels) if i not in exclude_indices]
         series_values = [0] * len(categories)
@@ -398,7 +472,8 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
     chart_type = _chart_type_map(chart_kind)
     chart_data = ChartData()
     chart_data.categories = categories
-    chart_data.add_series("Total" if total_idx is not None else "Series", series_values)
+    series_name = column_key if (column_key and column_key in col_labels) else ("Total" if "Total" in col_labels else "Series")
+    chart_data.add_series(series_name, series_values)
 
     chart_shape = slide.shapes.add_chart(chart_type, x, y, w, h, chart_data)
     chart = chart_shape.chart
@@ -429,13 +504,12 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
     _apply_series_colors(chart)
 
     # Tag the chart shape so the updater can find it
-    series_name = "Total" if total_idx is not None else "Series"
-    _tag_shape(chart_shape, "chart", table.get("title"), series_name)
+    _tag_shape(chart_shape, "chart", working_table.get("title"), series_name)
 
     # Optional table on the same slide
     if include_table:
         tbl = _add_table(slide, col_labels, row_labels, values)
-        _tag_shape(tbl, "table", table.get("title"))
+        _tag_shape(tbl, "table", working_table.get("title"))
 
     # Optional Base text
     if base_text:
@@ -444,7 +518,7 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
             base_y += 0.4  # Move base text down if question text is present
             
         tb = slide.shapes.add_textbox(Inches(0.5), Inches(base_y), Inches(9.0), Inches(0.4))
-        _tag_shape(tb, "text_base", table.get("title"))
+        _tag_shape(tb, "text_base", working_table.get("title"))
         tf = tb.text_frame
         tf.clear()
         p = tf.paragraphs[0]
@@ -483,16 +557,18 @@ def add_chart_slide(prs, table: Dict[str, Any], layout=5, chart_kind="bar_h", in
                 auto_update=callout.auto_update
             )
             
-            add_text_callout(slide, adjusted_callout, table)
+            add_text_callout(slide, adjusted_callout, working_table)
 
     # Embed small metadata box, can be ignored by updater
     meta = {
-        "table_key": table.get("title"),
+        "table_key": working_table.get("title"),
         "row_count": len(row_labels),
         "col_labels": col_labels,
         "chart_kind": chart_kind,
         "include_table": include_table,
         "callout_count": len(callouts) if callouts else 0,
+        "enable_sorting": enable_sorting,
+        "excluded_rows": excluded_rows or []
     }
     meta_json = json.dumps(meta)
     meta_box = slide.shapes.add_textbox(Inches(0.0), Inches(7.45), Inches(0.1), Inches(0.2))
@@ -541,6 +617,7 @@ def export_pptx(tables: List[Dict[str, Any]], selections: Dict[str, Dict[str, An
                     font_color=callout_data.get("font_color"),
                     bind_question=callout_data.get("bind_question", "TEXT_QUESTION"),
                     bind_base=callout_data.get("bind_base", "TEXT_BASE"),
+                    metric_type=callout_data.get("metric_type", "percentage"),
                     auto_update=callout_data.get("auto_update", True)
                 )
                 callouts.append(callout)
@@ -555,6 +632,9 @@ def export_pptx(tables: List[Dict[str, Any]], selections: Dict[str, Dict[str, An
             base_text=sel.get("base_text"),
             question_text=sel.get("question_text"),
             callouts=callouts,
+            enable_sorting=sel.get("enable_sorting", False),
+            excluded_rows=sel.get("excluded_rows", []),
+            column_key=sel.get("column_key")
         )
 
     prs.save(out_path)

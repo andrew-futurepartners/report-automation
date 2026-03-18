@@ -21,7 +21,7 @@ def parse_existing_powerpoint(pptx_file):
             for shape in slide.shapes:
                 alt = _parse_alt_text(shape)
                 
-                if alt.get("type") in ["chart", "table", "question_text", "text_base", "text_title", "text_callout"]:
+                if alt.get("type") in ["chart", "table", "question_text", "text_question", "text_base", "text_title", "text_callout"]:
                     table_title = alt.get("table_title")
                     if table_title:
                         if table_title not in existing_content:
@@ -32,21 +32,38 @@ def parse_existing_powerpoint(pptx_file):
                                 "chart_type": "bar_h",
                                 "custom_base_description": "",  # Store custom base description
                                 "custom_question": "",  # Store custom question text
-                                "callouts": []  # Initialize callouts list
+                                "callouts": [],  # Initialize callouts list
+                                # Presence flags for connected objects
+                                "has_chart": False,
+                                "has_table": False,
+                                "has_title": False,
+                                "has_base": False,
+                                "has_question": False,
+                                "has_callouts": False
                             }
                         
+                        # Track object presence
+                        if alt.get("type") == "chart":
+                            existing_content[table_title]["has_chart"] = True
+                            if "column" in alt:
+                                existing_content[table_title]["chart_column"] = alt.get("column")
+                        elif alt.get("type") == "table":
+                            existing_content[table_title]["has_table"] = True
+
                         # Extract question text
-                        if alt.get("type") == "question_text" and hasattr(shape, "text_frame"):
+                        if alt.get("type") in ["question_text", "text_question"] and hasattr(shape, "text_frame"):
                             question_text = shape.text_frame.text
                             if question_text.startswith("Question: "):
                                 question_text = question_text[10:]  # Remove "Question: " prefix
                             existing_content[table_title]["question_text"] = question_text
                             existing_content[table_title]["custom_question"] = question_text
+                            existing_content[table_title]["has_question"] = True
                         
                         # Extract base text
                         elif alt.get("type") == "text_base" and hasattr(shape, "text_frame"):
                             base_text = shape.text_frame.text
                             existing_content[table_title]["base_text"] = base_text
+                            existing_content[table_title]["has_base"] = True
                             
                             # Extract custom base description (everything before the N count)
                             if "Base:" in base_text:
@@ -78,6 +95,7 @@ def parse_existing_powerpoint(pptx_file):
                         # Extract chart title
                         elif alt.get("type") == "text_title" and hasattr(shape, "text_frame"):
                             existing_content[table_title]["title"] = shape.text_frame.text
+                            existing_content[table_title]["has_title"] = True
                         
                         # Extract text callouts
                         elif alt.get("type") == "text_callout" and hasattr(shape, "text_frame"):
@@ -86,14 +104,16 @@ def parse_existing_powerpoint(pptx_file):
                             
                             callout_text = shape.text_frame.text
                             callout_info = {
-                                "row_label": alt.get("row_label", ""),
+                                "row_label": alt.get("row", alt.get("row_label", "")),
                                 "column_key": alt.get("column", "Total"),
                                 "text": callout_text,
                                 "position": (0.5, 7.0, 9.0, 0.4),  # Default position
                                 "font_size": 12,
-                                "font_bold": True
+                                "font_bold": True,
+                                "metric_type": alt.get("metric_type", "percentage")
                             }
                             existing_content[table_title]["callouts"].append(callout_info)
+                            existing_content[table_title]["has_callouts"] = True
         
         return existing_content
     except Exception as e:
@@ -176,11 +196,30 @@ if workflow_type == "Create New Report":
         # Show default choice controls for new reports
         st.subheader("Step 3: Configure visualizations")
         
-        # Get all unique column labels across all tables for column selection
-        all_columns = set()
+        # Build banner list preserving datafile order (from the first table that has banners)
+        all_columns = []
+        found_order = False
         for table in data["tables"]:
-            all_columns.update(table.get("col_labels", []))
-        all_columns = sorted(list(all_columns))
+            meta = table.get("meta", {})
+            banners = meta.get("col_banners") or table.get("col_labels", [])
+            if banners and not found_order:
+                for b in banners:
+                    if b is None:
+                        continue
+                    norm_b = str(b).replace("\xa0", " ").strip()
+                    if norm_b and norm_b not in all_columns:
+                        all_columns.append(norm_b)
+                found_order = len(all_columns) > 0
+        # Fallback: aggregate in encountered order if no table provided banners
+        if not all_columns:
+            for table in data["tables"]:
+                banners = table.get("col_labels", [])
+                for b in banners:
+                    if b is None:
+                        continue
+                    norm_b = str(b).replace("\xa0", " ").strip()
+                    if norm_b and norm_b not in all_columns:
+                        all_columns.append(norm_b)
         
         # Default selections
         col1, col2 = st.columns(2)
@@ -261,30 +300,39 @@ else:
             
             # Show column selection for update workflow
             if data["tables"]:
-                # Get all unique column labels across all tables for column selection
-                all_columns = set()
+                # Build banner list preserving datafile order (from the first table that has banners)
+                all_columns = []
+                found_order = False
                 for table in data["tables"]:
-                    all_columns.update(table.get("col_labels", []))
-                all_columns = sorted(list(all_columns))
+                    meta = table.get("meta", {})
+                    banners = meta.get("col_banners") or table.get("col_labels", [])
+                    if banners and not found_order:
+                        for b in banners:
+                            if b is None:
+                                continue
+                            norm_b = str(b).replace("\xa0", " ").strip()
+                            if norm_b and norm_b not in all_columns:
+                                all_columns.append(norm_b)
+                        found_order = len(all_columns) > 0
+                if not all_columns:
+                    for table in data["tables"]:
+                        banners = table.get("col_labels", [])
+                        for b in banners:
+                            if b is None:
+                                continue
+                            norm_b = str(b).replace("\xa0", " ").strip()
+                            if norm_b and norm_b not in all_columns:
+                                all_columns.append(norm_b)
                 
                 st.subheader("Step 5: Configure column selection")
-                st.info("💡 Quickly switch to different segments (e.g., Male, Female, Gen Z) for all connected tables")
                 
-                col1, col2 = st.columns(2)
+                col1, _ = st.columns([1, 1])
                 with col1:
                     default_column = st.selectbox("Default column for updates", all_columns, 
                                                 index=all_columns.index("Total") if "Total" in all_columns else 0,
                                                 key="update_default_column")
                     apply_column_btn = st.button("Apply column to all connected tables", key="update_apply_column")
                 
-                with col2:
-                    st.write("**Available segments:**")
-                    # Show first 8 columns as examples
-                    segment_preview = all_columns[:8]
-                    if len(all_columns) > 8:
-                        segment_preview.append(f"... and {len(all_columns) - 8} more")
-                    for col in segment_preview:
-                        st.write(f"• {col}")
             
             # Set defaults for the rest of the logic
             default_choice = "Bar Horizontal"
@@ -337,11 +385,18 @@ if st.session_state.data is not None:
         tid = t["id"]
         with st.expander(f"{t['title']}  ({tid})", expanded=False):
             cols = st.columns([2, 1, 2])
+            # Lookup any existing mapping info for this table (from PPT)
+            existing_table = existing_content.get(t["title"], {})
             with cols[0]:
                 st.write("**Row labels**")
-                st.write(", ".join(t["row_labels"][:12]) + ("..." if len(t["row_labels"]) > 12 else ""))
-                st.write("**Columns**")
-                st.write(", ".join(t["col_labels"]))
+                # Show row labels as a concise bullet list; limit to first 12
+                _all_rows = [rl for rl in t["row_labels"] if isinstance(rl, str) and rl.strip()]
+                _preview = _all_rows[:12]
+                if _preview:
+                    st.markdown("\n".join([f"- {rl}" for rl in _preview]))
+                _remaining = max(0, len(_all_rows) - len(_preview))
+                if _remaining > 0:
+                    st.markdown(f"- … and {_remaining} more")
 
             with cols[1]:
                 options = ["Bar Horizontal", "Bar Vertical", "Donut", "Line", "Chart + Table"]
@@ -352,27 +407,94 @@ if st.session_state.data is not None:
                 choice = st.selectbox("Chart type", options, key=f"ctype_{tid}", index=options.index(choice))
                 
                 # Column selection for this table
-                col_options = t["col_labels"]
+                # Keep Data column as banners only, add Metric selector when available
+                meta = t.get("meta", {})
+                banners = meta.get("col_banners") or t.get("col_labels", [])
+                groups = meta.get("col_groups") or ["" for _ in banners]
+                combined_labels = t.get("col_labels", [])
+
+                # Derive metric options (unique, order-preserving, non-empty)
+                metric_options = []
+                seen_metrics = set()
+                for g in groups:
+                    if isinstance(g, str):
+                        g2 = g.strip()
+                        if g2 and g2 not in seen_metrics:
+                            seen_metrics.add(g2)
+                            metric_options.append(g2)
+                has_metrics = len(metric_options) > 0
+                if not has_metrics:
+                    metric_options = [""]
+
+                # Default metric: prefer session state; else metric parsed from mapped chart column; else left-most
+                leftmost_metric = next((g for g in groups if isinstance(g, str) and g.strip()), "")
+                current_metric = st.session_state["selections"].get(tid, {}).get("metric_key")
+                if not current_metric:
+                    mapped_col = existing_table.get("chart_column")
+                    if isinstance(mapped_col, str) and "|" in mapped_col:
+                        try:
+                            banner_part, metric_part = [p.strip() for p in mapped_col.split("|", 1)]
+                            current_metric = metric_part
+                        except Exception:
+                            current_metric = None
+                if not current_metric:
+                    current_metric = leftmost_metric
+                if current_metric not in metric_options:
+                    current_metric = metric_options[0]
+
+                if has_metrics:
+                    current_metric = st.selectbox("Metric", metric_options, key=f"metric_{tid}", index=metric_options.index(current_metric))
                 
                 # Handle column application for both new reports and updates
                 if workflow_type == "Create New Report" and apply_column_btn:
-                    # Apply default column to all tables for new reports
-                    current_col = default_column if default_column in col_options else ("Total" if "Total" in col_options else col_options[0] if col_options else "Total")
+                    # Apply default banner to all tables for new reports
+                    current_col = default_column if default_column in banners else ("Total" if "Total" in banners else banners[0] if banners else "Total")
                 elif workflow_type == "Update Existing Report" and apply_column_btn:
-                    # Apply default column to all connected tables for updates
-                    current_col = default_column if default_column in col_options else ("Total" if "Total" in col_options else col_options[0] if col_options else "Total")
+                    # Apply default banner to all connected tables for updates
+                    current_col = default_column if default_column in banners else ("Total" if "Total" in banners else banners[0] if banners else "Total")
                 else:
-                    # Use existing selection or default
-                    current_col = st.session_state["selections"].get(tid, {}).get("column_key", "Total")
-                    if current_col not in col_options:
-                        current_col = "Total" if "Total" in col_options else col_options[0] if col_options else "Total"
+                    # Use existing banner selection or mapped chart banner; else default
+                    current_col = st.session_state["selections"].get(tid, {}).get("banner_key")
+                    if not current_col:
+                        mapped_col = existing_table.get("chart_column")
+                        if isinstance(mapped_col, str):
+                            if "|" in mapped_col:
+                                try:
+                                    banner_part, metric_part = [p.strip() for p in mapped_col.split("|", 1)]
+                                    current_col = banner_part
+                                except Exception:
+                                    current_col = mapped_col.strip()
+                            else:
+                                current_col = mapped_col.strip()
+                    if not current_col:
+                        current_col = "Total"
+                    if current_col not in banners:
+                        current_col = "Total" if "Total" in banners else banners[0] if banners else "Total"
                 
-                selected_col = st.selectbox("Data column", col_options, 
-                                         index=col_options.index(current_col) if current_col in col_options else 0,
+                selected_col = st.selectbox("Data column", banners, 
+                                         index=banners.index(current_col) if current_col in banners else 0,
                                          key=f"col_{tid}")
+
+                # Resolve combined label for selected (metric, banner)
+                pair_to_combined = {}
+                for i, b in enumerate(banners):
+                    g = groups[i] if i < len(groups) else ""
+                    lab = combined_labels[i] if i < len(combined_labels) else b
+                    pair_to_combined[(g or "", b)] = lab
+                combined_selected = pair_to_combined.get(((current_metric or ""), selected_col))
+                if not combined_selected:
+                    # Fallback to the first column with this banner
+                    for i, b in enumerate(banners):
+                        if b == selected_col:
+                            combined_selected = combined_labels[i]
+                            break
+                if not combined_selected and combined_labels:
+                    combined_selected = combined_labels[0]
             with cols[2]:
                 # Use existing content if available, otherwise use defaults
-                existing_table = existing_content.get(t["title"], {})
+                has_title_obj = existing_table.get("has_title", False)
+                has_base_obj = existing_table.get("has_base", False)
+                has_question_obj = existing_table.get("has_question", False)
                 
                 # Chart title - prioritize existing custom title, then session state, then table title
                 existing_title = existing_table.get("title", "")
@@ -391,7 +513,9 @@ if st.session_state.data is not None:
                 if existing_title and existing_title != t["title"]:
                     title_label += " (Previously: " + existing_title + ")"
                 
-                title_val = st.text_input(title_label, value=default_title, key=f"title_{tid}")
+                title_val = None
+                if has_title_obj:
+                    title_val = st.text_input(title_label, value=default_title, key=f"title_{tid}")
 
                 # Base text logic - preserve custom descriptions while updating N values
                 def _find_base_idx(labels):
@@ -401,7 +525,21 @@ if st.session_state.data is not None:
                     return None
                 
                 base_idx = _find_base_idx(t["row_labels"])
-                total_idx = t["col_labels"].index("Total") if "Total" in t["col_labels"] else (0 if t["col_labels"] else None)
+                # Determine the Total column under the selected metric if applicable
+                total_idx = None
+                total_candidates = []
+                if (" | " in (combined_selected or "")):
+                    # Prefer banner-qualified by current metric first (Banner | Metric)
+                    metric_name = (current_metric or "").strip()
+                    if metric_name:
+                        total_candidates.append(f"Total | {metric_name}")
+                total_candidates.append("Total")
+                for cand in total_candidates:
+                    if cand in t["col_labels"]:
+                        total_idx = t["col_labels"].index(cand)
+                        break
+                if total_idx is None:
+                    total_idx = 0 if t["col_labels"] else None
                 
                 # Calculate new base N value
                 new_base_n = None
@@ -439,7 +577,9 @@ if st.session_state.data is not None:
                 if existing_table.get("custom_base_description"):
                     base_label += f" (Previously: {existing_table['custom_base_description']})"
                 
-                base_text_val = st.text_input(base_label, value=default_base, key=f"base_{tid}")
+                base_text_val = None
+                if has_base_obj:
+                    base_text_val = st.text_input(base_label, value=default_base, key=f"base_{tid}")
                 
                 # Question text - preserve custom questions
                 existing_q = existing_table.get("custom_question", "")
@@ -458,14 +598,66 @@ if st.session_state.data is not None:
                 if existing_q and existing_q != t["title"]:
                     question_label += " (Previously: " + existing_q + ")"
                 
-                question_text_val = st.text_input(question_label, value=default_q, key=f"qtext_{tid}")
+                question_text_val = None
+                if has_question_obj:
+                    question_text_val = st.text_input(question_label, value=default_q, key=f"qtext_{tid}")
 
-            # Callout management section
-            st.write("**Callouts**")
+            # Row sorting management section
+            st.write("**Row Sorting**")
             
+            # Toggle checkbox for row sorting
+            enable_sorting = st.checkbox(f"Enable row sorting for this table", value=False, key=f"enable_sorting_{tid}")
+            
+            if enable_sorting:
+                st.info("💡 Rows will be sorted by their values (descending). You can exclude certain rows from sorting.")
+                
+                # Get available rows for exclusion
+                available_rows = [row for row in t["row_labels"] if isinstance(row, str) and row.strip()]
+                
+                # Common rows that users might want to exclude from sorting
+                suggested_excludes = []
+                for row in available_rows:
+                    row_lower = row.lower().strip()
+                    if any(pattern in row_lower for pattern in ["other", "none", "don't know", "no answer", "prefer not", "n/a"]):
+                        suggested_excludes.append(row)
+                
+                # Row exclusion selection
+                exclude_options = ["None (sort all rows)"] + available_rows
+                default_excludes = ["None (sort all rows)"]
+                if suggested_excludes:
+                    default_excludes = suggested_excludes
+                
+                excluded_rows = st.multiselect(
+                    "Rows to exclude from sorting (will appear at bottom)",
+                    exclude_options,
+                    default=default_excludes,
+                    key=f"sort_exclude_{tid}",
+                    help="Select rows that should remain at the bottom and not be sorted by value"
+                )
+                
+                # Remove "None" option if other selections are made
+                if "None (sort all rows)" in excluded_rows and len(excluded_rows) > 1:
+                    excluded_rows = [row for row in excluded_rows if row != "None (sort all rows)"]
+                elif excluded_rows == ["None (sort all rows)"]:
+                    excluded_rows = []
+                
+                # Show preview of what will be sorted vs excluded
+                if excluded_rows:
+                    sortable_rows = [row for row in available_rows if row not in excluded_rows]
+                    st.write(f"**Will be sorted:** {len(sortable_rows)} rows")
+                    st.write(f"**Will stay at bottom:** {len(excluded_rows)} rows ({', '.join(excluded_rows[:3])}{'...' if len(excluded_rows) > 3 else ''})")
+                else:
+                    st.write(f"**Will be sorted:** All {len(available_rows)} rows")
+            else:
+                excluded_rows = []
+            
+            st.divider()
+            
+            # Callout management section (only if connected in PPT)
             # Check if there are existing callouts from PowerPoint or session state
             existing_table = existing_content.get(t["title"], {})
             existing_callouts = existing_table.get("callouts", []) if existing_table else []
+            has_callouts_obj = existing_table.get("has_callouts", False)
             current_callouts = st.session_state["selections"].get(tid, {}).get("callouts", [])
             total_callout_count = len(existing_callouts) + len(current_callouts)
             
@@ -474,38 +666,55 @@ if st.session_state.data is not None:
             default_enabled = (total_callout_count > 0 or 
                              st.session_state.get(f"enable_callouts_{tid}", False))
             
-            # Toggle checkbox for callouts
-            toggle_label = f"Enable callouts for this table"
-            if total_callout_count > 0:
-                toggle_label += f" ({total_callout_count} active)"
+            enable_callouts = False
+            if has_callouts_obj:
+                st.write("**Callouts**")
+                # Toggle checkbox for callouts
+                toggle_label = f"Enable callouts for this table"
+                if total_callout_count > 0:
+                    toggle_label += f" ({total_callout_count} active)"
+                enable_callouts = st.checkbox(toggle_label, value=default_enabled, key=f"enable_callouts_{tid}")
             
-            enable_callouts = st.checkbox(toggle_label, value=default_enabled, key=f"enable_callouts_{tid}")
-            
-            if enable_callouts:
-                st.info("💡 Select a row and column, then click 'Add Callout' to create text callouts")
-            else:
+            if not enable_callouts:
                 # Clear any existing callouts when disabled
                 if "callouts" in st.session_state["selections"].get(tid, {}):
                     st.session_state["selections"][tid]["callouts"] = []
             
-            if enable_callouts:
+            if has_callouts_obj and enable_callouts:
                 # Only show callout controls when enabled
-                callout_cols = st.columns([2, 1, 1])
-                
-                with callout_cols[0]:
-                    # Row selection for callouts
-                    available_rows = [row for row in t["row_labels"] if isinstance(row, str) and row.strip()]
-                    selected_row = st.selectbox("Select row for callout", available_rows, key=f"callout_row_{tid}")
-                
-                with callout_cols[1]:
-                    # Column selection for callout (defaults to selected column for chart)
-                    callout_col = st.selectbox("Callout column", col_options, 
-                                             index=col_options.index(selected_col) if selected_col in col_options else 0,
-                                             key=f"callout_col_{tid}")
-                
-                with callout_cols[2]:
-                    # Only show add callout button if no callouts exist yet
-                    if total_callout_count == 0:
+                if total_callout_count == 0:
+                    cc1, cc2, cc3 = st.columns([2, 1, 1])
+                    
+                    with cc1:
+                        # Row selection for callouts
+                        available_rows = [row for row in t["row_labels"] if isinstance(row, str) and row.strip()]
+                        selected_row = st.selectbox("Select row for callout", available_rows, key=f"callout_row_{tid}")
+                    
+                    with cc2:
+                        # Callout selectors: Banner only to users, Metric shown only if multiple
+                        callout_metric = current_metric
+                        if has_metrics:
+                            callout_metric = st.selectbox("Callout metric", metric_options, key=f"callout_metric_{tid}", index=metric_options.index(current_metric) if current_metric in metric_options else 0)
+                        callout_banner_default = selected_col if selected_col in banners else (banners[0] if banners else "")
+                        callout_banner = st.selectbox("Callout banner", banners, key=f"callout_banner_{tid}", index=banners.index(callout_banner_default) if callout_banner_default in banners else 0)
+                        # Metric type selector (display capitalized, store lowercase)
+                        metric_type_display = ["Percentage", "Number", "Currency"]
+                        default_metric_type = st.session_state["selections"].get(tid, {}).get("callout_metric_type", "percentage")
+                        def_idx = metric_type_display.index(default_metric_type.capitalize()) if default_metric_type and default_metric_type.capitalize() in metric_type_display else 0
+                        selected_metric_display = st.selectbox("Callout metric type", metric_type_display, key=f"callout_metric_type_{tid}", index=def_idx)
+                        callout_metric_type = selected_metric_display.lower()
+                        # Resolve to combined column label internally
+                        callout_col = pair_to_combined.get(((callout_metric or ""), callout_banner))
+                        if not callout_col:
+                            # Fallback to first occurrence of the banner
+                            for i, b in enumerate(banners):
+                                if b == callout_banner:
+                                    callout_col = combined_labels[i]
+                                    break
+                        if not callout_col and combined_labels:
+                            callout_col = combined_labels[0]
+                    
+                    with cc3:
                         if st.button("Add Callout", key=f"add_callout_{tid}"):
                             if "callouts" not in st.session_state["selections"][tid]:
                                 st.session_state["selections"][tid]["callouts"] = []
@@ -518,21 +727,23 @@ if st.session_state.data is not None:
                                 "text": default_text,  # Start with default "Row Name: Value" format
                                 "position": (0.5, 7.0, 9.0, 0.4),
                                 "font_size": 12,
-                                "font_bold": True
+                                "font_bold": True,
+                                "metric_type": callout_metric_type
                             }
                             
                             st.session_state["selections"][tid]["callouts"].append(new_callout)
                             st.success(f"Added callout for '{selected_row}'")
                             st.rerun()  # Refresh to update the UI
-                    else:
-                        st.info("📝 Callouts already exist for this table")
+                else:
+                    st.info("📝 Callouts already exist for this table")
                 
                 # Display existing callouts with editable text boxes
                 
                 # Show existing callouts from PowerPoint with "Previously:" indicator
-                if existing_callouts:
+                if has_callouts_obj and (existing_table.get("callouts", []) ):
                     st.write("**Existing Callouts from PowerPoint:**")
-                    for i, existing_callout in enumerate(existing_callouts):
+                    ecs = existing_table.get("callouts", [])
+                    for i, existing_callout in enumerate(ecs):
                         callout_display_cols = st.columns([4, 1, 1, 1])
                         
                         with callout_display_cols[0]:
@@ -547,14 +758,22 @@ if st.session_state.data is not None:
                                 key=f"existing_callout_text_{tid}_{i}",
                                 help="Customize your callout text. Use [Value] as a placeholder for the actual data value."
                             )
+                            # Metric type dropdown for existing callout (display capitalized, store lowercase)
+                            mt_display = ["Percentage", "Number", "Currency"]
+                            mt_current = existing_callout.get('metric_type', 'percentage')
+                            mt_idx = mt_display.index(mt_current.capitalize()) if mt_current and mt_current.capitalize() in mt_display else 0
+                            mt_updated_display = st.selectbox("Metric type", mt_display, index=mt_idx, key=f"existing_callout_metric_{tid}_{i}")
+                            mt_updated = mt_updated_display.lower()
                             
                             # Update the existing callout text in real-time
                             if updated_text != existing_callout['text']:
-                                existing_callouts[i]['text'] = updated_text
+                                ecs[i]['text'] = updated_text
+                            if mt_updated != existing_callout.get('metric_type'):
+                                ecs[i]['metric_type'] = mt_updated
                         
                         with callout_display_cols[1]:
                             if st.button("Remove", key=f"remove_existing_callout_{tid}_{i}"):
-                                existing_callouts.pop(i)
+                                ecs.pop(i)
                                 st.rerun()
                         
                         with callout_display_cols[2]:
@@ -583,10 +802,17 @@ if st.session_state.data is not None:
                                 key=f"callout_text_{tid}_{i}",
                                 help="Customize your callout text. Use [Value] as a placeholder for the actual data value."
                             )
+                            mt_display = ["Percentage", "Number", "Currency"]
+                            mt_current = callout.get('metric_type', 'percentage')
+                            mt_idx = mt_display.index(mt_current.capitalize()) if mt_current and mt_current.capitalize() in mt_display else 0
+                            mt_updated_display = st.selectbox("Metric type", mt_display, index=mt_idx, key=f"callout_metric_{tid}_{i}")
+                            mt_updated = mt_updated_display.lower()
                             
                             # Update the callout text in real-time
                             if updated_text != current_text:
                                 st.session_state["selections"][tid]["callouts"][i]["text"] = updated_text
+                            if mt_updated != mt_current:
+                                st.session_state["selections"][tid]["callouts"][i]["metric_type"] = mt_updated
                         
                         with callout_display_cols[1]:
                             if st.button("Remove", key=f"remove_callout_{tid}_{i}"):
@@ -611,27 +837,27 @@ if st.session_state.data is not None:
                     "Line":           "line",
                     "Chart + Table":  "chart+table"
                 }[choice],
-                "column_key": selected_col,  # Add selected column to selections
-                "title": title_val,
-                "base_text": base_text_val,
-                "question_text": question_text_val
+                # Persist both banner and metric plus the resolved combined label for export
+                "banner_key": selected_col,
+                "metric_key": current_metric,
+                "column_key": combined_selected,
+                "enable_sorting": enable_sorting,
+                "excluded_rows": excluded_rows if enable_sorting else []
             }
+
+            # Only include text fields if those objects are linked in PPT
+            if title_val is not None:
+                selection_dict["title"] = title_val
+            if base_text_val is not None:
+                selection_dict["base_text"] = base_text_val
+            if question_text_val is not None:
+                selection_dict["question_text"] = question_text_val
             
-            # Include callouts if the checkbox is enabled
+            # Include only user-created callouts in selections; do NOT merge in existing PPT callouts
             if enable_callouts:
-                # Combine existing callouts from PowerPoint with new callouts from session state
-                all_callouts = []
-                
-                # Add existing callouts from PowerPoint (if any)
-                if existing_table and "callouts" in existing_table:
-                    all_callouts.extend(existing_table["callouts"])
-                
-                # Add new callouts from session state (if any)
-                if "callouts" in st.session_state["selections"].get(tid, {}):
-                    all_callouts.extend(st.session_state["selections"][tid]["callouts"])
-                
-                if all_callouts:
-                    selection_dict["callouts"] = all_callouts
+                user_callouts = st.session_state["selections"].get(tid, {}).get("callouts", [])
+                if user_callouts:
+                    selection_dict["callouts"] = user_callouts
             
             st.session_state["selections"][tid] = selection_dict
 
@@ -643,8 +869,16 @@ if st.session_state.data is not None:
             # NEW REPORT EXPORT
             st.subheader("Step 4: Export new PowerPoint")
             if st.button("Export PowerPoint", type="primary"):
-                sels = {tid: {"chart_type": v["chart_type"], "column_key": v.get("column_key", "Total"), "title": v["title"], "base_text": v.get("base_text"), "question_text": v.get("question_text"), "callouts": v.get("callouts", [])}
-                        for tid, v in st.session_state["selections"].items()}
+                sels = {tid: {
+                    "chart_type": v["chart_type"], 
+                    "column_key": v.get("column_key", "Total"), 
+                    "title": v["title"], 
+                    "base_text": v.get("base_text"), 
+                    "question_text": v.get("question_text"), 
+                    "callouts": v.get("callouts", []),
+                    "enable_sorting": v.get("enable_sorting", False),
+                    "excluded_rows": v.get("excluded_rows", [])
+                } for tid, v in st.session_state["selections"].items()}
                 out = "report.pptx"
                 export_pptx(data["tables"], sels, out)
             with open(out, "rb") as f:
@@ -672,10 +906,12 @@ if st.session_state.data is not None:
                     new_table_sels[tid] = {
                         "chart_type": v["chart_type"],
                         "column_key": v.get("column_key", "Total"),
-                        "title": v["title"],
+                        "title": v.get("title"),
                         "base_text": v.get("base_text"),
                         "question_text": v.get("question_text"),
-                        "callouts": v.get("callouts", [])
+                        "callouts": v.get("callouts", []),
+                        "enable_sorting": v.get("enable_sorting", False),
+                        "excluded_rows": v.get("excluded_rows", [])
                     }
                 
                 # Convert selections to use table titles as keys for proper matching
@@ -686,7 +922,7 @@ if st.session_state.data is not None:
                         if t["id"] == tid:
                             table_selections[t["title"]] = {
                                 "chart_type": v["chart_type"],
-                                "title": v["title"],
+                                "title": v.get("title"),
                                 "base_text": v.get("base_text"),
                                 "question_text": v.get("question_text")
                             }
@@ -703,5 +939,3 @@ if st.session_state.data is not None:
 if st.session_state.data is None:
     if workflow_type == "Create New Report":
         st.info("👆 Upload a crosstab Excel file to begin creating your report.")
-else:
-        st.info("👆 Upload an existing PowerPoint file to begin the update process.")
