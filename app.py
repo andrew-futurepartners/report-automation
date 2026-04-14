@@ -4,6 +4,7 @@ from pptx_exporter import export_pptx
 from deck_update import update_presentation, update_presentation_with_unmapped
 from pptx import Presentation
 from deck_update import _parse_alt_text
+from ai_insights import generate_all_insights
 
 def _format_number_with_commas(number):
     """Format a number with comma separators for thousands places."""
@@ -21,7 +22,7 @@ def parse_existing_powerpoint(pptx_file):
             for shape in slide.shapes:
                 alt = _parse_alt_text(shape)
                 
-                if alt.get("type") in ["chart", "table", "question_text", "text_question", "text_base", "text_title", "text_callout"]:
+                if alt.get("type") in ["chart", "table", "question_text", "text_question", "text_base", "text_title", "text_callout", "text_takeaway", "text_analysis", "text_chart_title", "ai_insight"]:
                     table_title = alt.get("table_title")
                     if table_title:
                         if table_title not in existing_content:
@@ -176,6 +177,8 @@ if "existing_content" not in st.session_state:
     st.session_state.existing_content = {}
 if "data" not in st.session_state:
     st.session_state.data = None
+if "selections" not in st.session_state:
+    st.session_state["selections"] = {}
 
 # Workflow branching
 if workflow_type == "Create New Report":
@@ -224,7 +227,7 @@ if workflow_type == "Create New Report":
         # Default selections
         col1, col2 = st.columns(2)
         with col1:
-            default_choice = st.selectbox("Default visualization", ["Bar Horizontal", "Bar Vertical", "Donut", "Line", "Chart + Table"], index=0)
+            default_choice = st.selectbox("Default visualization", ["Horizontal Bar", "Vertical Bar", "Donut", "Line", "Grouped Bar (2)", "Grouped Bar (3)", "Multi-Line", "Table Only", "Chart + Table"], index=0)
             apply_all_btn = st.button("Apply chart type to all")
         
         with col2:
@@ -335,16 +338,12 @@ else:
                 
             
             # Set defaults for the rest of the logic
-            default_choice = "Bar Horizontal"
+            default_choice = "Horizontal Bar"
             apply_all_btn = False
         else:
             # If no data yet, set default values
             default_column = "Total"
             apply_column_btn = False
-
-    # Selections state
-    if "selections" not in st.session_state:
-        st.session_state["selections"] = {}
 
 # Only show table configuration if we have data loaded
 if st.session_state.data is not None:
@@ -399,7 +398,7 @@ if st.session_state.data is not None:
                     st.markdown(f"- … and {_remaining} more")
 
             with cols[1]:
-                options = ["Bar Horizontal", "Bar Vertical", "Donut", "Line", "Chart + Table"]
+                options = ["Horizontal Bar", "Vertical Bar", "Donut", "Line", "Grouped Bar (2)", "Grouped Bar (3)", "Multi-Line", "Table Only", "Chart + Table"]
                 if apply_all_btn:
                     choice = default_choice
                 else:
@@ -490,6 +489,23 @@ if st.session_state.data is not None:
                             break
                 if not combined_selected and combined_labels:
                     combined_selected = combined_labels[0]
+
+                # Multi-column selection for grouped / multi-series chart types
+                multi_series_types = {"Grouped Bar (2)", "Grouped Bar (3)", "Multi-Line"}
+                multi_columns_selected = None
+                if choice in multi_series_types:
+                    n_series = 3 if choice == "Grouped Bar (3)" else 2
+                    default_multi = st.session_state["selections"].get(tid, {}).get("column_keys", [])
+                    if not default_multi or len(default_multi) < 2:
+                        default_multi = combined_labels[:n_series] if len(combined_labels) >= n_series else combined_labels
+                    multi_columns_selected = st.multiselect(
+                        f"Select {n_series} columns for series",
+                        combined_labels,
+                        default=default_multi[:n_series],
+                        key=f"multi_col_{tid}",
+                        max_selections=n_series if choice != "Multi-Line" else 5,
+                    )
+
             with cols[2]:
                 # Use existing content if available, otherwise use defaults
                 has_title_obj = existing_table.get("has_title", False)
@@ -828,19 +844,25 @@ if st.session_state.data is not None:
                         st.divider()
 
             # Build selections dictionary
+            chart_label_to_key = {
+                "Horizontal Bar":    "bar_h",
+                "Vertical Bar":      "bar_v",
+                "Donut":             "donut",
+                "Line":              "line",
+                "Grouped Bar (2)":   "grouped_bar_2",
+                "Grouped Bar (3)":   "grouped_bar_3",
+                "Multi-Line":        "multi_line",
+                "Table Only":        "table_only",
+                "Chart + Table":     "chart_table",
+            }
             selection_dict = {
                 "chart_type_label": choice,
-                "chart_type": {
-                    "Bar Horizontal": "bar_h",
-                    "Bar Vertical":   "bar_v",
-                    "Donut":          "donut",
-                    "Line":           "line",
-                    "Chart + Table":  "chart+table"
-                }[choice],
+                "chart_type": chart_label_to_key.get(choice, "bar_h"),
                 # Persist both banner and metric plus the resolved combined label for export
                 "banner_key": selected_col,
                 "metric_key": current_metric,
                 "column_key": combined_selected,
+                "column_keys": multi_columns_selected if multi_columns_selected else None,
                 "enable_sorting": enable_sorting,
                 "excluded_rows": excluded_rows if enable_sorting else []
             }
@@ -870,9 +892,10 @@ if st.session_state.data is not None:
             st.subheader("Step 4: Export new PowerPoint")
             if st.button("Export PowerPoint", type="primary"):
                 sels = {tid: {
-                    "chart_type": v["chart_type"], 
-                    "column_key": v.get("column_key", "Total"), 
-                    "title": v["title"], 
+                    "chart_type": v.get("chart_type", "bar_h"), 
+                    "column_key": v.get("column_key", "Total"),
+                    "column_keys": v.get("column_keys"),
+                    "title": v.get("title"), 
                     "base_text": v.get("base_text"), 
                     "question_text": v.get("question_text"), 
                     "callouts": v.get("callouts", []),
@@ -880,9 +903,15 @@ if st.session_state.data is not None:
                     "excluded_rows": v.get("excluded_rows", [])
                 } for tid, v in st.session_state["selections"].items()}
                 out = "report.pptx"
-                export_pptx(data["tables"], sels, out)
-            with open(out, "rb") as f:
-                st.download_button("Download report.pptx", f, file_name="report.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
+                ai_data = None
+                try:
+                    with st.spinner("Generating AI insights..."):
+                        ai_data = generate_all_insights(data["tables"], selections=sels)
+                except Exception as e:
+                    st.warning(f"AI insights skipped: {e}")
+                export_pptx(data["tables"], sels, out, ai_insights=ai_data)
+                with open(out, "rb") as f:
+                    st.download_button("Download report.pptx", f, file_name="report.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
         
         else:
             # UPDATE EXISTING REPORT
@@ -904,7 +933,7 @@ if st.session_state.data is not None:
                 new_table_sels = {}
                 for tid, v in st.session_state["selections"].items():
                     new_table_sels[tid] = {
-                        "chart_type": v["chart_type"],
+                        "chart_type": v.get("chart_type", "bar_h"),
                         "column_key": v.get("column_key", "Total"),
                         "title": v.get("title"),
                         "base_text": v.get("base_text"),
@@ -921,7 +950,7 @@ if st.session_state.data is not None:
                     for t in data["tables"]:
                         if t["id"] == tid:
                             table_selections[t["title"]] = {
-                                "chart_type": v["chart_type"],
+                                "chart_type": v.get("chart_type", "bar_h"),
                                 "title": v.get("title"),
                                 "base_text": v.get("base_text"),
                                 "question_text": v.get("question_text")

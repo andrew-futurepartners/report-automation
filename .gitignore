@@ -11,6 +11,9 @@ build/
 *.swp
 *.swo
 
+# Secrets
+.env
+
 # PowerPoint temp/lock files
 ~$*.pptx
 
@@ -19,6 +22,9 @@ uploaded.xlsx
 to_update.pptx
 updated_report.pptx
 report.pptx
+
+# Stale root-level template copy (real copy lives in templates/)
+/Template_ReportSlides.pptx
 
 # OS
 .DS_Store
