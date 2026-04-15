@@ -1,16 +1,132 @@
+import logging
+import os
+import tempfile
+
 import streamlit as st
 from crosstab_parser import parse_workbook
 from pptx_exporter import export_pptx
-from deck_update import update_presentation, update_presentation_with_unmapped
+from deck_update import update_presentation, update_presentation_with_unmapped, _parse_alt_text
 from pptx import Presentation
-from deck_update import _parse_alt_text
+from smart_match import SmartMatcher
 from ai_insights import generate_all_insights
+from text_utils import format_number_with_commas, parse_base_text, format_base_text
 
-def _format_number_with_commas(number):
-    """Format a number with comma separators for thousands places."""
-    if number is None:
-        return None
-    return f"{number:,}"
+logging.basicConfig(
+    level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(levelname)s | %(name)s | %(message)s",
+)
+
+
+def _save_temp(data_buf, suffix: str, session_key: str) -> str:
+    """Write *data_buf* to a NamedTemporaryFile, store the path in session_state,
+    and clean up any previous temp file stored under the same key."""
+    old = st.session_state.get(session_key)
+    if old and os.path.exists(old):
+        try:
+            os.unlink(old)
+        except OSError:
+            pass
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp.write(data_buf if isinstance(data_buf, bytes) else data_buf.getbuffer())
+    tmp.close()
+    st.session_state[session_key] = tmp.name
+    return tmp.name
+
+
+def _render_diff_table(old_tv: dict, new_table: dict):
+    """Render a side-by-side diff of old PPT table values vs new crosstab data.
+
+    *old_tv* has ``{"headers": [...], "rows": [[...], ...]}``.
+    *new_table* is a standard crosstab table dict.
+    """
+    import pandas as pd
+
+    old_headers = old_tv.get("headers", [])
+    old_rows = old_tv.get("rows", [])
+    if not old_headers or not old_rows:
+        st.write("No previous table data available.")
+        return
+
+    old_row_labels = [r[0] for r in old_rows] if old_rows else []
+    old_col_headers = old_headers[1:] if len(old_headers) > 1 else old_headers
+
+    new_row_labels = new_table.get("row_labels", [])
+    new_col_labels = new_table.get("col_labels", [])
+    new_values = new_table.get("values", [])
+
+    all_rows = list(dict.fromkeys(old_row_labels + [str(r) for r in new_row_labels]))
+    common_cols = [c for c in old_col_headers if c in new_col_labels]
+    if not common_cols:
+        common_cols = old_col_headers[:5]
+
+    old_map = {}
+    for r in old_rows:
+        if r:
+            old_map[r[0]] = r[1:] if len(r) > 1 else []
+
+    new_map = {}
+    for i, rl in enumerate(new_row_labels):
+        row_vals = new_values[i] if i < len(new_values) else []
+        cells = {}
+        for j, cl in enumerate(new_col_labels):
+            cells[cl] = row_vals[j] if j < len(row_vals) else None
+        new_map[str(rl)] = cells
+
+    diff_rows = []
+    statuses = []
+    for rl in all_rows:
+        row_data = {"Row": rl}
+        in_old = rl in old_map
+        in_new = rl in new_map
+        if in_old and not in_new:
+            statuses.append("removed")
+        elif in_new and not in_old:
+            statuses.append("added")
+        else:
+            statuses.append("existing")
+        for ci, col in enumerate(common_cols):
+            old_val = ""
+            if in_old and ci < len(old_map.get(rl, [])):
+                old_val = old_map[rl][ci]
+            new_val = ""
+            if in_new:
+                nv = new_map.get(rl, {}).get(col)
+                if nv is not None:
+                    try:
+                        fv = float(nv)
+                        new_val = f"{fv:.1f}" if fv != int(fv) or fv <= 100 else f"{int(fv)}"
+                    except (ValueError, TypeError):
+                        new_val = str(nv)
+            changed = str(old_val).strip() != str(new_val).strip()
+            marker = " *" if changed and in_old and in_new else ""
+            row_data[f"{col} (old)"] = old_val
+            row_data[f"{col} (new)"] = f"{new_val}{marker}"
+        diff_rows.append(row_data)
+
+    df = pd.DataFrame(diff_rows)
+
+    def _highlight(row):
+        idx = diff_rows.index(row.to_dict()) if row.to_dict() in diff_rows else -1
+        status = statuses[idx] if 0 <= idx < len(statuses) else "existing"
+        if status == "added":
+            return ["background-color: #d4edda"] * len(row)
+        if status == "removed":
+            return ["background-color: #f8d7da"] * len(row)
+        styles = []
+        for val in row:
+            if isinstance(val, str) and val.endswith(" *"):
+                styles.append("background-color: #fff3cd")
+            else:
+                styles.append("")
+        return styles
+
+    st.dataframe(df.style.apply(_highlight, axis=1), use_container_width=True, hide_index=True)
+
+    legend_cols = st.columns(3)
+    legend_cols[0].markdown('<span style="background:#d4edda;padding:2px 8px;border-radius:3px;">Added rows</span>', unsafe_allow_html=True)
+    legend_cols[1].markdown('<span style="background:#fff3cd;padding:2px 8px;border-radius:3px;">Changed values (*)</span>', unsafe_allow_html=True)
+    legend_cols[2].markdown('<span style="background:#f8d7da;padding:2px 8px;border-radius:3px;">Removed rows</span>', unsafe_allow_html=True)
+
 
 def parse_existing_powerpoint(pptx_file):
     """Parse existing PowerPoint to extract current content and settings."""
@@ -50,6 +166,21 @@ def parse_existing_powerpoint(pptx_file):
                                 existing_content[table_title]["chart_column"] = alt.get("column")
                         elif alt.get("type") == "table":
                             existing_content[table_title]["has_table"] = True
+                            if shape.has_table:
+                                tbl = shape.table
+                                headers = []
+                                for c in range(len(tbl.columns)):
+                                    headers.append(tbl.cell(0, c).text_frame.text.strip())
+                                rows_data = []
+                                for r in range(1, len(tbl.rows)):
+                                    row_vals = []
+                                    for c in range(len(tbl.columns)):
+                                        row_vals.append(tbl.cell(r, c).text_frame.text.strip())
+                                    rows_data.append(row_vals)
+                                existing_content[table_title]["table_values"] = {
+                                    "headers": headers,
+                                    "rows": rows_data,
+                                }
 
                         # Extract question text
                         if alt.get("type") in ["question_text", "text_question"] and hasattr(shape, "text_frame"):
@@ -66,32 +197,9 @@ def parse_existing_powerpoint(pptx_file):
                             existing_content[table_title]["base_text"] = base_text
                             existing_content[table_title]["has_base"] = True
                             
-                            # Extract custom base description (everything before the N count)
-                            if "Base:" in base_text:
-                                # Look for patterns like "Base: Total respondents. 123 complete surveys."
-                                # or "Base: Total respondents. 123"
-                                base_parts = base_text.split(".")
-                                if len(base_parts) >= 2:
-                                    # First part contains the custom description
-                                    custom_desc = base_parts[0].replace("Base:", "").strip()
-                                    # Clean up any trailing punctuation or equals signs
-                                    custom_desc = custom_desc.rstrip(" =").strip()
-                                    existing_content[table_title]["custom_base_description"] = custom_desc
-                                else:
-                                    # No period, might be just "Base: Total respondents 123"
-                                    base_parts = base_text.split()
-                                    if len(base_parts) >= 3:
-                                        # Extract everything after "Base:" but before the number
-                                        base_idx = base_parts.index("Base:")
-                                        if base_idx >= 0 and base_idx + 1 < len(base_parts):
-                                            # Find where the number starts
-                                            for i in range(base_idx + 1, len(base_parts)):
-                                                if base_parts[i].replace(",", "").isdigit():
-                                                    custom_desc = " ".join(base_parts[base_idx + 1:i])
-                                                    # Clean up any trailing punctuation or equals signs
-                                                    custom_desc = custom_desc.rstrip(" =").strip()
-                                                    existing_content[table_title]["custom_base_description"] = custom_desc
-                                                    break
+                            parsed_base = parse_base_text(base_text)
+                            if parsed_base["description"]:
+                                existing_content[table_title]["custom_base_description"] = parsed_base["description"]
                         
                         # Extract chart title
                         elif alt.get("type") == "text_title" and hasattr(shape, "text_frame"):
@@ -188,9 +296,8 @@ if workflow_type == "Create New Report":
     
     if uploaded:
         with st.spinner("Parsing workbook..."):
-            with open("uploaded.xlsx", "wb") as f:
-                f.write(uploaded.getbuffer())
-            data = parse_workbook("uploaded.xlsx")
+            xlsx_path = _save_temp(uploaded, ".xlsx", "_tmp_xlsx")
+            data = parse_workbook(xlsx_path)
             st.session_state.data = data
 
         st.success(f"Found {len(data['tables'])} tables")
@@ -243,9 +350,7 @@ else:
         with st.spinner("Parsing existing PowerPoint..."):
             existing_content = parse_existing_powerpoint(existing_ppt)
             st.session_state.existing_content = existing_content
-            # Save the PowerPoint file for later use
-            with open("to_update.pptx", "wb") as pf:
-                pf.write(existing_ppt.getbuffer())
+            _save_temp(existing_ppt, ".pptx", "_tmp_pptx")
 
         if existing_content:
             st.success(f"Found connections for {len(existing_content)} tables")
@@ -265,9 +370,8 @@ else:
         
         if uploaded:
             with st.spinner("Parsing workbook..."):
-                with open("uploaded.xlsx", "wb") as f:
-                    f.write(uploaded.getbuffer())
-                data = parse_workbook("uploaded.xlsx")
+                xlsx_path = _save_temp(uploaded, ".xlsx", "_tmp_xlsx")
+                data = parse_workbook(xlsx_path)
                 st.session_state.data = data
 
             st.success(f"Found {len(data['tables'])} tables in crosstab")
@@ -434,7 +538,7 @@ if st.session_state.data is not None:
                         try:
                             banner_part, metric_part = [p.strip() for p in mapped_col.split("|", 1)]
                             current_metric = metric_part
-                        except Exception:
+                        except ValueError:
                             current_metric = None
                 if not current_metric:
                     current_metric = leftmost_metric
@@ -461,7 +565,7 @@ if st.session_state.data is not None:
                                 try:
                                     banner_part, metric_part = [p.strip() for p in mapped_col.split("|", 1)]
                                     current_col = banner_part
-                                except Exception:
+                                except ValueError:
                                     current_col = mapped_col.strip()
                             else:
                                 current_col = mapped_col.strip()
@@ -562,31 +666,19 @@ if st.session_state.data is not None:
                 if base_idx is not None and total_idx is not None and base_idx < len(t["values"]) and total_idx < len(t["values"][base_idx]):
                     try:
                         new_base_n = int(round(float(t["values"][base_idx][total_idx])))
-                    except Exception:
+                    except (ValueError, TypeError, IndexError):
                         new_base_n = None
                 
                 # Determine base text default - preserve custom descriptions
                 # Priority: existing content > session state > calculated default
                 if existing_table.get("custom_base_description"):
-                    # Use existing custom description with new N value
-                    custom_desc = existing_table["custom_base_description"]
-                    if new_base_n is not None:
-                        # Use the custom description as-is, don't force "Total respondents"
-                        default_base = f"Base: {custom_desc}. {_format_number_with_commas(new_base_n)} complete surveys."
-                    else:
-                        default_base = f"Base: {custom_desc}."
+                    default_base = format_base_text(existing_table["custom_base_description"], new_base_n)
                 elif existing_table.get("base_text"):
-                    # Use existing base text as-is
                     default_base = existing_table["base_text"]
                 else:
-                    # Check session state as fallback
                     default_base = st.session_state["selections"].get(tid, {}).get("base_text")
                     if default_base is None:
-                        # Calculate default from crosstab
-                        if new_base_n is not None:
-                            default_base = f"Base: Total respondents. {_format_number_with_commas(new_base_n)} complete surveys."
-                        else:
-                            default_base = "Base: Total respondents."
+                        default_base = format_base_text("Total respondents", new_base_n)
                 
                 # Show indicator if using existing custom base description
                 base_label = "Base text"
@@ -902,7 +994,7 @@ if st.session_state.data is not None:
                     "enable_sorting": v.get("enable_sorting", False),
                     "excluded_rows": v.get("excluded_rows", [])
                 } for tid, v in st.session_state["selections"].items()}
-                out = "report.pptx"
+                out = _save_temp(b"", ".pptx", "_tmp_out_pptx")
                 ai_data = None
                 try:
                     with st.spinner("Generating AI insights..."):
@@ -928,39 +1020,194 @@ if st.session_state.data is not None:
             - Custom formatting and content will be preserved where possible
             """)
             
+            # --- Match review ---
+            if "match_review" not in st.session_state:
+                st.session_state.match_review = None
+            if "match_overrides" not in st.session_state:
+                st.session_state.match_overrides = {}
+
+            if st.button("Preview Matches", key="preview_matches"):
+                prs_preview = Presentation(st.session_state["_tmp_pptx"])
+                matcher = SmartMatcher(data["tables"])
+                shapes_meta = []
+                for slide in prs_preview.slides:
+                    for shp in slide.shapes:
+                        alt = _parse_alt_text(shp)
+                        if alt.get("auto_update", "yes").lower() == "no":
+                            continue
+                        is_chart = False
+                        try:
+                            _ = shp.chart
+                            is_chart = True
+                        except (ValueError, AttributeError):
+                            pass
+                        if is_chart or shp.has_table:
+                            stype = "Chart" if is_chart else "Table"
+                            shapes_meta.append({"name": shp.name or "", "alt": alt, "shape_type": stype})
+                matcher.match_all(shapes_meta)
+                st.session_state.match_review = matcher.get_report()
+                st.session_state.match_overrides = {}
+
+            if st.session_state.match_review:
+                report = st.session_state.match_review
+                table_titles = [t["title"] for t in data["tables"]]
+
+                # Build title → resolved column_key from current selections
+                _title_to_col = {}
+                for _tid, _sel in st.session_state["selections"].items():
+                    for _t in data["tables"]:
+                        if _t["id"] == _tid:
+                            _title_to_col[_t["title"]] = (
+                                _sel.get("column_key") or _sel.get("banner_key") or "Total"
+                            )
+                            break
+
+                with st.expander("Match Review", expanded=True):
+                    # Approve All / Skip unmatched helper
+                    approve_col, skip_col, _ = st.columns([1, 1, 4])
+                    with approve_col:
+                        if st.button("Approve All", key="approve_all_matches"):
+                            st.session_state.match_overrides = {}
+                            for entry in report:
+                                label = entry["shape_alt_title"] or entry["shape_name"]
+                                if entry["status"] in ("failed", "duplicate", "skipped"):
+                                    st.session_state.match_overrides[label] = "__skip__"
+                            st.rerun()
+                    with skip_col:
+                        if st.button("Skip All Unmatched", key="skip_unmatched"):
+                            for entry in report:
+                                if entry["status"] in ("failed", "duplicate"):
+                                    label = entry["shape_alt_title"] or entry["shape_name"]
+                                    st.session_state.match_overrides[label] = "__skip__"
+                            st.rerun()
+
+                    # Header row
+                    hdr = st.columns([1, 3, 2, 1, 1, 1, 3])
+                    hdr[0].markdown("**Type**")
+                    hdr[1].markdown("**Old Title**")
+                    hdr[2].markdown("**Matched Title**")
+                    hdr[3].markdown("**Conf.**")
+                    hdr[4].markdown("**Tier**")
+                    hdr[5].markdown("**Column**")
+                    hdr[6].markdown("**Action**")
+
+                    _TIER_LABELS = {0: "—", 1: "Exact", 2: "Fuzzy", 3: "LLM"}
+
+                    for i, entry in enumerate(report):
+                        tier = entry["tier"]
+                        conf = entry["confidence"]
+                        status = entry["status"]
+                        shape_label = entry["shape_alt_title"] or entry["shape_name"] or f"Shape {i}"
+                        matched = entry["matched_table"] or "—"
+                        stype = entry.get("shape_type", "?")
+                        resolved_col = _title_to_col.get(matched, "—") if matched != "—" else "—"
+
+                        if status in ("failed", "duplicate", "skipped"):
+                            row_color = "#FADADD"
+                        elif status == "low_confidence" or 0.60 <= conf < 0.85:
+                            row_color = "#FFF3CD"
+                        elif conf >= 0.85:
+                            row_color = "#D4EDDA"
+                        else:
+                            row_color = "#FADADD"
+
+                        st.markdown(
+                            f'<div style="background:{row_color};padding:2px 6px;border-radius:4px;margin-bottom:2px;">&nbsp;</div>',
+                            unsafe_allow_html=True,
+                        )
+                        row = st.columns([1, 3, 2, 1, 1, 1, 3])
+                        row[0].write(stype)
+                        row[1].write(shape_label)
+                        row[2].write(matched)
+                        row[3].write(f"{conf:.0%}" if conf else "—")
+                        row[4].write(_TIER_LABELS.get(tier, str(tier)))
+                        row[5].write(resolved_col)
+
+                        action_options = [f"Update ({matched})", "Skip"] + table_titles
+                        current_override = st.session_state.match_overrides.get(shape_label)
+                        if current_override == "__skip__":
+                            default_idx = 1
+                        elif current_override and current_override in table_titles:
+                            default_idx = 2 + table_titles.index(current_override)
+                        else:
+                            default_idx = 0
+
+                        action = row[6].selectbox(
+                            "Action",
+                            action_options,
+                            index=default_idx,
+                            key=f"match_action_{i}",
+                            label_visibility="collapsed",
+                        )
+                        if action == "Skip":
+                            st.session_state.match_overrides[shape_label] = "__skip__"
+                        elif action.startswith("Update ("):
+                            st.session_state.match_overrides.pop(shape_label, None)
+                        else:
+                            st.session_state.match_overrides[shape_label] = action
+
+            # --- Data diff preview for connected tables ---
+            if st.session_state.match_review:
+                connected_with_data = [
+                    title for title, info in existing_content.items()
+                    if info.get("table_values")
+                ]
+                if connected_with_data:
+                    with st.expander("Data Changes Preview", expanded=False):
+                        for title in connected_with_data:
+                            old_tv = existing_content[title]["table_values"]
+                            new_table = next(
+                                (t for t in data["tables"] if t["title"] == title), None
+                            )
+                            if not new_table:
+                                continue
+                            st.markdown(f"**{title}**")
+                            _render_diff_table(old_tv, new_table)
+                            st.divider()
+
             if st.button("Update PowerPoint", type="primary"):
-                # Build selections for new tables only
-                new_table_sels = {}
-                for tid, v in st.session_state["selections"].items():
-                    new_table_sels[tid] = {
-                        "chart_type": v.get("chart_type", "bar_h"),
-                        "column_key": v.get("column_key", "Total"),
-                        "title": v.get("title"),
-                        "base_text": v.get("base_text"),
-                        "question_text": v.get("question_text"),
-                        "callouts": v.get("callouts", []),
-                        "enable_sorting": v.get("enable_sorting", False),
-                        "excluded_rows": v.get("excluded_rows", [])
-                    }
-                
-                # Convert selections to use table titles as keys for proper matching
+                # Convert selections to use table titles as keys with all fields
                 table_selections = {}
                 for tid, v in st.session_state["selections"].items():
-                    # Find the table title for this tid
                     for t in data["tables"]:
                         if t["id"] == tid:
                             table_selections[t["title"]] = {
                                 "chart_type": v.get("chart_type", "bar_h"),
+                                "column_key": v.get("column_key", "Total"),
+                                "column_keys": v.get("column_keys"),
                                 "title": v.get("title"),
                                 "base_text": v.get("base_text"),
-                                "question_text": v.get("question_text")
+                                "question_text": v.get("question_text"),
+                                "callouts": v.get("callouts", []),
+                                "enable_sorting": v.get("enable_sorting", False),
+                                "excluded_rows": v.get("excluded_rows", []),
                             }
                             break
-                
-                # Update presentation with enhanced functionality
-                updated = update_presentation_with_unmapped("to_update.pptx", "uploaded.xlsx", "updated_report.pptx", 
-                                                          table_selections, data["tables"], existing_content)
-                
+
+                # Build SmartMatcher with user overrides from match review
+                overrides = st.session_state.get("match_overrides", {})
+                matcher = SmartMatcher(
+                    data["tables"],
+                    overrides=overrides if overrides else None,
+                )
+
+                progress_bar = st.progress(0, text="Updating presentation...")
+
+                def _on_progress(pct: float):
+                    progress_bar.progress(min(pct, 1.0), text=f"Updating... {pct:.0%}")
+
+                out_path = _save_temp(b"", ".pptx", "_tmp_updated_pptx")
+                updated = update_presentation_with_unmapped(
+                    st.session_state["_tmp_pptx"],
+                    st.session_state["_tmp_xlsx"],
+                    out_path,
+                    table_selections, data["tables"], existing_content,
+                    matcher=matcher,
+                    progress_callback=_on_progress,
+                )
+
+                progress_bar.progress(1.0, text="Update complete!")
+
                 with open(updated, "rb") as f:
                     st.download_button("Download updated_report.pptx", f, file_name="updated_report.pptx", mime="application/vnd.openxmlformats-officedocument.presentationml.presentation")
 

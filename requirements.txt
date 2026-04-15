@@ -4,3 +4,6 @@ openpyxl
 python-pptx
 openai
 python-dotenv
+pytest
+pytest-mock
+lxml

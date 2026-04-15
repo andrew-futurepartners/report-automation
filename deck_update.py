@@ -1,53 +1,72 @@
-from pptx import Presentation
-from pptx.chart.data import ChartData
-from typing import Dict, Any, List, Optional, Tuple
-import re, json
+"""
+deck_update.py — Update an existing PowerPoint presentation with new crosstab data.
 
+Matches shapes to tables via alt-text metadata, updates chart data (preserving
+formatting), refreshes table cells, question/base/title text, and callouts.
+"""
+
+import logging
+import math
+import re
+from typing import Dict, Any, List, Optional, Tuple
+
+from pptx import Presentation
+
+from chart_data_patcher import detect_value_format, patch_chart_data, patch_chart_series
 from crosstab_parser import parse_workbook
+from smart_match import SmartMatcher
+from text_utils import (
+    parse_base_text,
+    format_base_text,
+    format_number_with_commas,
+    safe_update_text,
+)
+
+logger = logging.getLogger("report_relay.deck_update")
 
 EXCLUDE_PREFIXES = ("base", "mean", "average", "avg")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
 
+
 def _parse_alt_text(shape) -> Dict[str, str]:
     """Parse alt text with enhanced flexibility for manual editing."""
     out: Dict[str, str] = {}
-    
-    # Method 1: Try to read from XML descr attribute (most reliable)
+
     try:
-        if hasattr(shape, 'element'):
-            # Look for the cNvPr element which contains the description
+        if hasattr(shape, "element"):
             c_nv_pr = None
-            
-            # For GraphicFrame (charts/tables)
-            if 'graphicFrame' in shape.element.tag:
-                c_nv_pr = shape.element.find('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
-            # For Shape (text boxes, etc.)
-            elif 'sp' in shape.element.tag:
-                c_nv_pr = shape.element.find('.//p:cNvPr', namespaces={'p': 'http://schemas.openxmlformats.org/presentationml/2006/main'})
-            
-            if c_nv_pr is not None and c_nv_pr.get('descr'):
-                alt = c_nv_pr.get('descr')
-            else:
-                alt = ""
+            if "graphicFrame" in shape.element.tag:
+                c_nv_pr = shape.element.find(
+                    ".//p:cNvPr",
+                    namespaces={"p": "http://schemas.openxmlformats.org/presentationml/2006/main"},
+                )
+            elif "sp" in shape.element.tag:
+                c_nv_pr = shape.element.find(
+                    ".//p:cNvPr",
+                    namespaces={"p": "http://schemas.openxmlformats.org/presentationml/2006/main"},
+                )
+            alt = c_nv_pr.get("descr") if c_nv_pr is not None and c_nv_pr.get("descr") else ""
         else:
             alt = ""
-    except Exception:
+    except (AttributeError, TypeError):
         alt = ""
-    
-    # Method 2: Fallback to alternative_text property (if it exists)
+
     if not alt:
         try:
             alt = shape.alternative_text or ""
-        except Exception:
+        except (AttributeError, ValueError):
             alt = ""
-    
-    # Parse the alt text content
+
     for line in alt.splitlines():
         line = line.strip()
         if ":" in line:
-            # Handle both "key: value" and "key : value" formats
             if " : " in line:
                 k, v = line.split(" : ", 1)
             else:
@@ -55,10 +74,9 @@ def _parse_alt_text(shape) -> Dict[str, str]:
             out[_norm(k)] = v.strip()
     return out
 
+
 def _exclude_indices(labels: List[str], extra_excludes: Optional[List[str]] = None) -> set:
-    """Return indices to exclude based on default prefixes and optional explicit names.
-    Matching is case-insensitive; explicit names match either full equality or prefix.
-    """
+    """Return indices to exclude based on default prefixes and optional explicit names."""
     ex = set()
     extra_norm = []
     if extra_excludes:
@@ -83,8 +101,10 @@ def _exclude_indices(labels: List[str], extra_excludes: Optional[List[str]] = No
                 break
     return ex
 
+
 def _row_index_map(labels: List[str]) -> Dict[str, int]:
     return {_norm(l): i for i, l in enumerate(labels)}
+
 
 def _choose_col_idx(col_labels: List[str], col_key: Optional[str]) -> Optional[int]:
     if not col_labels:
@@ -96,8 +116,8 @@ def _choose_col_idx(col_labels: List[str], col_key: Optional[str]) -> Optional[i
             return col_labels.index(cand)
     return 0
 
+
 def _series_from_table(table: Dict[str, Any], col_idx: Optional[int], exclude_rows: set):
-    import math
     cats, vals = [], []
     row_labels = table["row_labels"]
     values = table["values"]
@@ -110,314 +130,107 @@ def _series_from_table(table: Dict[str, Any], col_idx: Optional[int], exclude_ro
         else:
             row = values[i]
             val = row[col_idx] if col_idx < len(row) else None
-            
-            # Clean the value to handle NaN and infinite values
             if val is not None:
                 try:
-                    # Convert to float to check for NaN/inf
                     float_val = float(val)
                     if math.isnan(float_val) or math.isinf(float_val):
-                        # Replace NaN/inf with None (which becomes 0 in charts)
                         val = None
                     else:
                         val = float_val
                 except (ValueError, TypeError):
-                    # If conversion fails, treat as None
                     val = None
-            
             vals.append(val)
     return cats, vals
 
-def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str], explicit_rows: Optional[List[str]], exclude_terms: Optional[List[str]] = None):
+
+def _find_base_row_idx(row_labels: List[str]) -> Optional[int]:
+    """Find the index of the 'base' row in row_labels."""
+    for i, lab in enumerate(row_labels):
+        if isinstance(lab, str) and _norm(lab).startswith("base"):
+            return i
+    return None
+
+
+def _get_base_n(table: Dict[str, Any], col_key: Optional[str] = None) -> Optional[int]:
+    """Extract base N from the table for a given column."""
+    base_idx = _find_base_row_idx(table.get("row_labels", []))
+    if base_idx is None:
+        return None
+    ci = _choose_col_idx(table.get("col_labels", []), col_key or "Total")
+    if ci is None:
+        return None
+    values = table.get("values", [])
+    if base_idx < len(values) and ci < len(values[base_idx]):
+        try:
+            return int(round(float(values[base_idx][ci])))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Chart update
+# ---------------------------------------------------------------------------
+
+def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str],
+                  explicit_rows: Optional[List[str]],
+                  exclude_terms: Optional[List[str]] = None,
+                  column_keys: Optional[List[str]] = None):
+    """Update chart data in-place via XML patching (preserves all formatting)."""
     chart = shape.chart
-    col_idx = _choose_col_idx(table["col_labels"], col_key)
+    alt = _parse_alt_text(shape)
     ex = _exclude_indices(table["row_labels"], exclude_terms)
 
-    if explicit_rows:
-        idx_map = _row_index_map(table["row_labels"])
-        cats, vals = [], []
-        for lab in explicit_rows:
-            j = idx_map.get(_norm(lab))
-            if j is None or j in ex:
-                continue
-            cats.append(lab)
-            if col_idx is None:
-                vals.append(None)
-            else:
-                row = table["values"][j]
-                vals.append(row[col_idx] if col_idx < len(row) else None)
+    # --- Extract data series ---
+    multi_series: Optional[List[tuple]] = None
+    if column_keys and len(column_keys) >= 2:
+        cats = None
+        multi_series = []
+        for ck in column_keys:
+            ci = _choose_col_idx(table["col_labels"], ck)
+            c, v = _series_from_table(table, ci, ex)
+            if cats is None:
+                cats = c
+            multi_series.append((ck, v))
+        if cats is None:
+            cats = []
+        vals = multi_series[0][1] if multi_series else []
     else:
-        cats, vals = _series_from_table(table, col_idx, ex)
+        col_idx = _choose_col_idx(table["col_labels"], col_key)
+        if explicit_rows:
+            idx_map = _row_index_map(table["row_labels"])
+            cats, vals = [], []
+            for lab in explicit_rows:
+                j = idx_map.get(_norm(lab))
+                if j is None or j in ex:
+                    continue
+                cats.append(lab)
+                if col_idx is None:
+                    vals.append(None)
+                else:
+                    row = table["values"][j]
+                    vals.append(row[col_idx] if col_idx < len(row) else None)
+        else:
+            cats, vals = _series_from_table(table, col_idx, ex)
 
-    # Store current chart formatting before updating data (to preserve label/axis formats)
-    chart_formatting = {}
-    series_formats = []
-    plot_labels_fmt = {}
-    try:
-        # Store chart type
-        chart_formatting['chart_type'] = chart.chart_type
-        
-        # Store chart style if available
-        if hasattr(chart, 'chart_style'):
-            chart_formatting['chart_style'] = chart.chart_style
-            
-        # Store plot area formatting
-        if hasattr(chart, 'plot_area'):
-            plot_area = chart.plot_area
-            if hasattr(plot_area, 'format'):
-                chart_formatting['plot_format'] = plot_area.format
-                
-        # Store chart area formatting
-        if hasattr(chart, 'chart_area'):
-            chart_area = chart.chart_area
-            if hasattr(chart_area, 'format'):
-                chart_formatting['chart_area_format'] = chart_area.format
+    # --- Patch chart data at XML level (formatting stays intact) ---
+    value_fmt = detect_value_format(vals, alt)
 
-        # Store plot-level data label settings (some charts use plot labels only)
-        try:
-            plots = getattr(chart, 'plots', None)
-            if plots and len(plots) > 0 and hasattr(plots[0], 'data_labels'):
-                pdl = plots[0].data_labels
-                plot_labels_fmt['exists'] = True
-                try:
-                    plot_labels_fmt['show_value'] = pdl.show_value
-                except Exception:
-                    plot_labels_fmt['show_value'] = None
-                try:
-                    plot_labels_fmt['number_format'] = pdl.number_format
-                except Exception:
-                    plot_labels_fmt['number_format'] = None
-                try:
-                    plot_labels_fmt['number_format_is_linked'] = pdl.number_format_is_linked
-                except Exception:
-                    plot_labels_fmt['number_format_is_linked'] = None
-                try:
-                    plot_labels_fmt['position'] = pdl.position
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    if multi_series:
+        patch_chart_series(
+            chart,
+            [(name, cats, v) for name, v in multi_series],
+            value_format=value_fmt,
+        )
+    else:
+        patch_chart_data(chart, cats, vals, value_format=value_fmt)
 
-        # Store per-series data label settings
-        for s in chart.series:
-            fmt = {}
-            try:
-                dl = s.data_labels
-                fmt['show_value'] = getattr(dl, 'show_value', None)
-                # number_format may raise if not supported on this chart type
-                try:
-                    fmt['number_format'] = dl.number_format
-                except Exception:
-                    fmt['number_format'] = None
-                try:
-                    fmt['number_format_is_linked'] = dl.number_format_is_linked
-                except Exception:
-                    fmt['number_format_is_linked'] = None
-                # Per-point formats (some decks set label formats on points)
-                point_formats = []
-                try:
-                    for pt in getattr(s, 'points', []):
-                        pf = {}
-                        try:
-                            pf['number_format'] = pt.data_label.number_format
-                        except Exception:
-                            pf['number_format'] = None
-                        try:
-                            pf['number_format_is_linked'] = pt.data_label.number_format_is_linked
-                        except Exception:
-                            pf['number_format_is_linked'] = None
-                        point_formats.append(pf)
-                except Exception:
-                    pass
-                fmt['point_formats'] = point_formats
-                try:
-                    fmt['position'] = dl.position
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            series_formats.append(fmt)
+    logger.info("Updated chart data for table: %s", table.get("title"))
 
-        # Store axis tick label formats
-        try:
-            if hasattr(chart, 'value_axis') and hasattr(chart.value_axis, 'tick_labels'):
-                chart_formatting['value_axis_number_format'] = chart.value_axis.tick_labels.number_format
-                try:
-                    chart_formatting['value_axis_number_format_is_linked'] = chart.value_axis.tick_labels.number_format_is_linked
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        try:
-            if hasattr(chart, 'category_axis') and hasattr(chart.category_axis, 'tick_labels'):
-                chart_formatting['category_axis_number_format'] = chart.category_axis.tick_labels.number_format
-                try:
-                    chart_formatting['category_axis_number_format_is_linked'] = chart.category_axis.tick_labels.number_format_is_linked
-                except Exception:
-                    pass
-        except Exception:
-            pass
-                
-    except Exception as e:
-        print(f"Warning: Could not preserve all chart formatting: {e}")
 
-    # Determine if values look like proportions (0..1) to enforce % formatting if needed
-    def _looks_percent(values_list):
-        try:
-            numeric = [float(v) for v in values_list if v is not None]
-            if not numeric:
-                return False
-            mn, mx = min(numeric), max(numeric)
-            return 0.0 <= mn <= 1.0 and 0.0 <= mx <= 1.1 and mx >= 0.05
-        except Exception:
-            return False
-    series_values_snapshot = [list(vals)]  # single-series for now
-    looks_percent_flags = [_looks_percent(vals)]
-
-    # Update the chart data
-    cd = ChartData()
-    cd.categories = cats
-    cd.add_series(col_key if col_idx is not None else "Series", vals)
-    chart.replace_data(cd)
-    
-    # Restore chart formatting after data update
-    try:
-        # Restore chart type if it was changed
-        if 'chart_type' in chart_formatting:
-            chart.chart_type = chart_formatting['chart_type']
-            
-        # Restore chart style if it was changed
-        if 'chart_style' in chart_formatting:
-            chart.chart_style = chart_formatting['chart_style']
-        
-        # Re-apply per-series data label formats
-        if series_formats:
-            for i, s in enumerate(chart.series):
-                fmt = series_formats[min(i, len(series_formats)-1)]
-                try:
-                    dl = s.data_labels
-                    if 'show_value' in fmt and fmt['show_value'] is not None:
-                        dl.show_value = fmt['show_value']
-                    if 'number_format' in fmt and fmt['number_format']:
-                        try:
-                            if hasattr(dl, 'number_format_is_linked'):
-                                dl.number_format_is_linked = False
-                        except Exception:
-                            pass
-                        dl.number_format = fmt['number_format']
-                    elif 'number_format' in fmt and not fmt['number_format']:
-                        # Fallback: apply axis format if it looks percent-like
-                        ax_fmt = chart_formatting.get('value_axis_number_format') or chart_formatting.get('category_axis_number_format')
-                        if isinstance(ax_fmt, str) and '%' in ax_fmt:
-                            try:
-                                if hasattr(dl, 'number_format_is_linked'):
-                                    dl.number_format_is_linked = False
-                            except Exception:
-                                pass
-                            dl.number_format = ax_fmt
-                    # Final fallback: enforce % if series values look like proportions
-                    if looks_percent_flags[min(i, len(looks_percent_flags)-1)]:
-                        try:
-                            current_fmt = None
-                            try:
-                                current_fmt = dl.number_format
-                            except Exception:
-                                current_fmt = None
-                            if not (isinstance(current_fmt, str) and '%' in current_fmt):
-                                if hasattr(dl, 'number_format_is_linked'):
-                                    dl.number_format_is_linked = False
-                                dl.number_format = "0.0%"
-                        except Exception:
-                            pass
-                    if 'position' in fmt and fmt['position'] is not None:
-                        try:
-                            dl.position = fmt['position']
-                        except Exception:
-                            pass
-                    # Re-apply per-point formats if available
-                    pts = getattr(s, 'points', [])
-                    point_formats = fmt.get('point_formats') or []
-                    for j, pt in enumerate(pts):
-                        pf = point_formats[min(j, len(point_formats)-1)] if point_formats else {}
-                        try:
-                            if pf.get('number_format'):
-                                if hasattr(pt.data_label, 'number_format_is_linked'):
-                                    pt.data_label.number_format_is_linked = False
-                                pt.data_label.number_format = pf['number_format']
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-        # Re-apply plot-level label formats (or enforce % if needed)
-        try:
-            plots = getattr(chart, 'plots', None)
-            if plots and len(plots) > 0 and hasattr(plots[0], 'data_labels'):
-                pdl = plots[0].data_labels
-                fmt = plot_labels_fmt
-                # If original had explicit fmt, reapply
-                if fmt.get('exists'):
-                    try:
-                        if fmt.get('show_value') is not None:
-                            pdl.show_value = fmt['show_value']
-                    except Exception:
-                        pass
-                    try:
-                        if fmt.get('number_format'):
-                            if hasattr(pdl, 'number_format_is_linked'):
-                                pdl.number_format_is_linked = False
-                            pdl.number_format = fmt['number_format']
-                    except Exception:
-                        pass
-                    try:
-                        if fmt.get('position') is not None:
-                            pdl.position = fmt['position']
-                    except Exception:
-                        pass
-                # Final fallback: enforce percent at plot level when values look like proportions
-                if looks_percent_flags and looks_percent_flags[0]:
-                    try:
-                        curr = None
-                        try:
-                            curr = pdl.number_format
-                        except Exception:
-                            curr = None
-                        if not (isinstance(curr, str) and '%' in curr):
-                            if hasattr(pdl, 'number_format_is_linked'):
-                                pdl.number_format_is_linked = False
-                            pdl.number_format = "0.0%"
-                            pdl.show_value = True
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # Restore axis tick label formats (e.g., percentages)
-        try:
-            if 'value_axis_number_format' in chart_formatting and hasattr(chart, 'value_axis') and hasattr(chart.value_axis, 'tick_labels'):
-                try:
-                    if 'value_axis_number_format_is_linked' in chart_formatting and hasattr(chart.value_axis.tick_labels, 'number_format_is_linked'):
-                        chart.value_axis.tick_labels.number_format_is_linked = False
-                except Exception:
-                    pass
-                chart.value_axis.tick_labels.number_format = chart_formatting['value_axis_number_format']
-        except Exception:
-            pass
-        try:
-            if 'category_axis_number_format' in chart_formatting and hasattr(chart, 'category_axis') and hasattr(chart.category_axis, 'tick_labels'):
-                try:
-                    if 'category_axis_number_format_is_linked' in chart_formatting and hasattr(chart.category_axis.tick_labels, 'number_format_is_linked'):
-                        chart.category_axis.tick_labels.number_format_is_linked = False
-                except Exception:
-                    pass
-                chart.category_axis.tick_labels.number_format = chart_formatting['category_axis_number_format']
-        except Exception:
-            pass
-            
-    except Exception as e:
-        print(f"Warning: Could not restore all chart formatting: {e}")
-    
-    print(f"✓ Updated chart data while preserving formatting for table: {table.get('title')}")
+# ---------------------------------------------------------------------------
+# Table update
+# ---------------------------------------------------------------------------
 
 def _update_table(shape, table: Dict[str, Any]):
     if not shape.has_table:
@@ -441,1021 +254,556 @@ def _update_table(shape, table: Dict[str, Any]):
                 try:
                     val = table["values"][j][ci]
                     if val is not None:
-                        import math
                         float_val = float(val)
                         if math.isnan(float_val) or math.isinf(float_val):
-                            txt = ""  # Display empty for NaN/inf values
+                            txt = ""
                         else:
                             txt = f"{float_val:.1f}"
                     else:
                         txt = ""
-                except Exception:
+                except (ValueError, TypeError, IndexError):
                     txt = ""
-            
-            # Preserve formatting by updating only the text content, not the entire cell
-            cell = tbl.cell(r, c)
-            if hasattr(cell, 'text_frame') and hasattr(cell.text_frame, 'paragraphs'):
-                if len(cell.text_frame.paragraphs) > 0:
-                    paragraph = cell.text_frame.paragraphs[0]
-                    if paragraph.runs:
-                        # Update only the first run's text, preserving formatting
-                        paragraph.runs[0].text = txt
-                    else:
-                        # No runs, create one with the new text
-                        run = paragraph.add_run()
-                        run.text = txt
-                else:
-                    # No paragraphs, create one
-                    paragraph = cell.text_frame.add_paragraph()
-                    run = paragraph.add_run()
-                    run.text = txt
-            else:
-                # Fallback to updating the entire text_frame
-                cell.text = txt
-    
-    print(f"✓ Updated table data while preserving formatting for table: {table.get('title')}")
+
+            safe_update_text(tbl.cell(r, c), txt)
+
+    logger.info("Updated table data (preserving formatting) for table: %s", table.get("title"))
+
+
+# ---------------------------------------------------------------------------
+# Shape finders
+# ---------------------------------------------------------------------------
 
 def _find_shape(slide, name: str):
-    """Find shape by name with enhanced search capabilities."""
     for shp in slide.shapes:
         if shp.name == name:
             return shp
     return None
 
+
 def _find_shapes_by_pattern(slide, pattern: str):
-    """Find shapes that match a pattern (useful for manual naming)."""
     matches = []
     for shp in slide.shapes:
         if shp.name and pattern.lower() in shp.name.lower():
             matches.append(shp)
     return matches
 
-def _get_table_mapping_from_shape(shape, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Enhanced table mapping that handles both automatic and manual configurations."""
-    name = shape.name or ""
-    alt = _parse_alt_text(shape)
-    
-    # Priority 1: Direct table_title match from alt text
-    if "table_title" in alt:
-        table_title = alt["table_title"]
-        # Try exact match first
-        for table in data["tables"]:
-            if table.get("title") == table_title:
-                return table
-        
-        # Try normalized match
-        norm_title = _norm(table_title)
-        for table in data["tables"]:
-            if _norm(table.get("title", "")) == norm_title:
-                return table
-    
-    # Priority 2: Shape name pattern matching
-    if name.startswith("TABLE_"):
-        # Extract table title from name
-        table_title = name[6:].replace("_", " ")  # Remove "TABLE_" prefix
-        for table in data["tables"]:
-            if _norm(table.get("title", "")) == _norm(table_title):
-                return table
-    
-    # Priority 3: Legacy TABLE: format
-    if name.startswith("TABLE:"):
-        parts = name.split(":", 1)
-        if len(parts) == 2:
-            table_title = parts[1].strip()
-            for table in data["tables"]:
-                if _norm(table.get("title", "")) == _norm(table_title):
-                    return table
-    
-    return None
 
-def _get_chart_mapping_from_shape(shape, data: Dict[str, Any], selections: Optional[Dict[str, Any]] = None) -> Optional[Tuple[Dict[str, Any], Optional[str], Optional[List[str]]]]:
-    """Enhanced chart mapping that handles both automatic and manual configurations."""
-    name = shape.name or ""
-    alt = _parse_alt_text(shape)
-    exclude_terms: Optional[List[str]] = None
-    table = None
-    col_key = None
-    
-    # Priority 1: Direct mapping from alt text
-    if "table_title" in alt:
-        table_title = alt["table_title"]
-        col_key = alt.get("column")
-        # Parse optional exclude_rows: comma-separated list
-        if 'exclude_rows' in alt and isinstance(alt['exclude_rows'], str):
-            exclude_terms = [p.strip() for p in alt['exclude_rows'].split(',')]
-        
-        # Find matching table
-        for t in data["tables"]:
-            if t.get("title") == table_title:
-                table = t
-                break
-        
-        if not table:
-            # Try normalized match
-            norm_title = _norm(table_title)
-            for t in data["tables"]:
-                if _norm(t.get("title", "")) == norm_title:
-                    table = t
-                    break
-    
-    # Priority 2: Shape name pattern matching
-    if not table and name.startswith("CHART_"):
-        # Extract table title and column from name
-        name_parts = name[6:].split("_")  # Remove "CHART_" prefix
-        if len(name_parts) >= 2:
-            # Last part might be column, rest is table title
-            potential_col = name_parts[-1]
-            table_title = "_".join(name_parts[:-1])
-            
-            # Check if last part is a valid column name
-            for t in data["tables"]:
-                if _norm(t.get("title", "")) == _norm(table_title):
-                    if potential_col in t.get("col_labels", []):
-                        table = t
-                        col_key = potential_col
-                        break
-                    else:
-                        # Last part wasn't a column, treat whole thing as table title
-                        table_title = "_".join(name_parts)
-                        if _norm(t.get("title", "")) == _norm(table_title):
-                            table = t
-                            break
-    
-    # Priority 3: Legacy CHART: format
-    if not table and name.startswith("CHART:"):
-        parts = name.split(":", 2)
-        if len(parts) >= 2:
-            table_title = parts[1].strip()
-            col_key = parts[2].strip() if len(parts) == 3 else None
-            
-            for t in data["tables"]:
-                if _norm(t.get("title", "")) == _norm(table_title):
-                    table = t
-                    break
-    
-    # Priority 4: Use column_key from selections if available
-    if table and selections and table.get("title") in selections:
-        selection = selections[table.get("title")]
-        if "column_key" in selection:
-            col_key = selection["column_key"]
-    
-    return (table, col_key, exclude_terms) if table else None
+# ---------------------------------------------------------------------------
+# Shape → table mapping
+# ---------------------------------------------------------------------------
 
-def _format_number_with_commas(number):
-    """Format a number with comma separators for thousands places."""
-    if number is None:
+def _match_shape(
+    matcher: SmartMatcher, shape, selections: Optional[Dict[str, Any]] = None,
+) -> Optional[Tuple[Dict[str, Any], Optional[str], Optional[List[str]]]]:
+    """Use SmartMatcher to resolve a shape to (table, col_key, exclude_terms).
+
+    Applies a selections override for ``column_key`` when present.
+    """
+    alt = _parse_alt_text(shape)
+    name = shape.name or ""
+    result = matcher.match({"name": name, "alt": alt})
+    if result is None or result.table is None:
         return None
-    return f"{number:,}"
 
-def _update_question_and_base(slide, table: Dict[str, Any], col_key: Optional[str], explicit_rows: Optional[List[int]]):
-    """Update question and base text based on alt text mapping, preserving custom content."""
-    # Find shapes by alt text type instead of name
+    table = result.table
+    col_key = result.col_key
+    exclude_terms = result.exclude_terms
+
+    if table and selections and table.get("title") in selections:
+        sel_col = selections[table["title"]].get("column_key")
+        if sel_col:
+            col_key = sel_col
+
+    return (table, col_key, exclude_terms)
+
+
+# ---------------------------------------------------------------------------
+# Unified question / base / title update
+# ---------------------------------------------------------------------------
+
+def _update_question_and_base(slide, table: Dict[str, Any],
+                              selections: Optional[dict] = None,
+                              table_title: Optional[str] = None):
+    """Update question, base, and title text shapes on a slide.
+
+    When *selections* contains an entry for *table_title*, values from that
+    selection dict drive the update (question_text, base_text, title).
+    Otherwise the function falls back to crosstab-derived defaults.
+    """
+    title_key = table_title or table.get("title", "")
+    table_selection = None
+    if selections and title_key in selections:
+        table_selection = selections[title_key]
+    elif selections:
+        logger.debug("No selection found for table: %s", title_key)
+
     for shape in slide.shapes:
         alt = _parse_alt_text(shape)
-        
-        # Update question text (support both legacy 'question_text' and 'text_question')
-        if alt.get("type") in ["question_text", "text_question"] and alt.get("table_title") == table.get("title"):
-            if hasattr(shape, "text_frame"):
-                # Preserve existing custom question text if it's different from the table title
+
+        # --- Question text ---
+        if alt.get("type") in ("question_text", "text_question") and alt.get("table_title") == title_key:
+            if not hasattr(shape, "text_frame"):
+                continue
+            if table_selection and "question_text" in table_selection:
+                new_text = f"Question: {table_selection['question_text']}"
+                safe_update_text(shape, new_text, preserve_font=True)
+                logger.info("Updated question text for table: %s", title_key)
+            else:
                 current_text = shape.text_frame.text
                 if current_text.startswith("Question: "):
-                    existing_question = current_text[10:]  # Remove "Question: " prefix
-                    # Only update if the existing question is the same as table title (default)
-                    # This preserves custom questions that users have written
+                    existing_question = current_text[10:]
                     if existing_question == table.get("title", ""):
-                        # Preserve formatting by only updating the text content
-                        if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                            paragraph = shape.text_frame.paragraphs[0]
-                            if paragraph.runs:
-                                paragraph.runs[0].text = f"Question: {table.get('title', '')}"
-                            else:
-                                run = paragraph.add_run()
-                                run.text = f"Question: {table.get('title', '')}"
-                        else:
-                            shape.text_frame.text = f"Question: {table.get('title', '')}"
-                        print(f"✓ Updated question text for table: {table.get('title')}")
+                        safe_update_text(shape, f"Question: {table.get('title', '')}")
+                        logger.info("Updated question text for table: %s", table.get("title"))
                     else:
-                        print(f"✓ Preserved custom question text: {existing_question}")
+                        logger.info("Preserved custom question text: %s", existing_question)
                 else:
-                    # No "Question: " prefix, add it while preserving formatting
-                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                        paragraph = shape.text_frame.paragraphs[0]
-                        if paragraph.runs:
-                            paragraph.runs[0].text = f"Question: {table.get('title', '')}"
-                        else:
-                            run = paragraph.add_run()
-                            run.text = f"Question: {table.get('title', '')}"
-                    else:
-                        shape.text_frame.text = f"Question: {table.get('title', '')}"
-                    print(f"✓ Added question text for table: {table.get('title')}")
-        
-        # Update base text
-        elif alt.get("type") == "text_base" and alt.get("table_title") == table.get("title"):
-            if hasattr(shape, "text_frame"):
-                # Calculate new base size
-                base_n = None
-                row_labels = table["row_labels"]
-                values = table["values"]
-                col_labels = table["col_labels"]
-                base_idx = None
-                
-                for i, lab in enumerate(row_labels):
-                    if _norm(lab).startswith("base"):
-                        base_idx = i
-                        break
-                
-                if base_idx is not None:
-                    ci = _choose_col_idx(col_labels, "Total")
-                    if ci is not None and base_idx < len(values) and ci < len(values[base_idx]):
-                        try:
-                            base_n = int(round(float(values[base_idx][ci])))
-                        except Exception:
-                            base_n = None
-                
-                # Preserve custom base description while updating N value
+                    safe_update_text(shape, f"Question: {table.get('title', '')}")
+                    logger.info("Added question text for table: %s", table.get("title"))
+
+        # --- Base text ---
+        elif alt.get("type") == "text_base" and alt.get("table_title") == title_key:
+            if not hasattr(shape, "text_frame"):
+                continue
+            if table_selection and "base_text" in table_selection:
+                base_text_template = table_selection["base_text"]
+                col_key_sel = table_selection.get("column_key")
+
+                if col_key_sel:
+                    new_n = _get_base_n(table, col_key_sel)
+                else:
+                    new_n = None
+
+                if new_n is not None:
+                    parsed = parse_base_text(base_text_template)
+                    desc = parsed["description"] or "Total respondents"
+                    new_text = format_base_text(desc, new_n)
+                else:
+                    new_text = base_text_template
+
+                safe_update_text(shape, new_text, preserve_font=True)
+                logger.info("Updated base text for table: %s", title_key)
+            else:
                 current_base_text = shape.text_frame.text
-                custom_description = ""
-                
-                # Extract custom description from existing text
-                if "Base:" in current_base_text:
-                    # Look for patterns like "Base: Total respondents. 123 complete surveys."
-                    base_parts = current_base_text.split(".")
-                    if len(base_parts) >= 2:
-                        # First part contains the custom description
-                        custom_description = base_parts[0].replace("Base:", "").strip()
-                        # Clean up any trailing punctuation or equals signs
-                        custom_description = custom_description.rstrip(" =").strip()
-                    else:
-                        # No period, might be just "Base: Total respondents 123"
-                        base_parts = current_base_text.split()
-                        if len(base_parts) >= 3:
-                            base_idx_text = base_parts.index("Base:")
-                            if base_idx_text >= 0 and base_idx_text + 1 < len(base_parts):
-                                # Find where the number starts
-                                for i in range(base_idx_text + 1, len(base_parts)):
-                                    if base_parts[i].replace(",", "").isdigit():
-                                        custom_description = " ".join(base_parts[base_idx_text + 1:i])
-                                        # Clean up any trailing punctuation or equals signs
-                                        custom_description = custom_description.rstrip(" =").strip()
-                                        break
-                
-                # Use custom description if found, otherwise use default
-                if custom_description:
-                    if base_n is not None:
-                        # Use the custom description as-is, don't force "Total respondents"
-                        new_text = f"Base: {custom_description}. {_format_number_with_commas(base_n)} complete surveys."
-                    else:
-                        new_text = f"Base: {custom_description}."
-                    print(f"✓ Updated base text for table: {table.get('title')} - preserved custom description: {custom_description}, new N: {_format_number_with_commas(base_n)}")
-                else:
-                    # Use default description
-                    if base_n is not None:
-                        new_text = f"Base: Total respondents. {_format_number_with_commas(base_n)} complete surveys."
-                    else:
-                        new_text = "Base: Total respondents."
-                    print(f"✓ Updated base text for table: {table.get('title')} - Base: {_format_number_with_commas(base_n)}")
-                
-                # Preserve formatting by only updating the text content, not the entire text_frame
-                if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                    # Update only the first paragraph's text, preserving formatting
-                    paragraph = shape.text_frame.paragraphs[0]
-                    if paragraph.runs:
-                        # Update the first run's text, preserving its formatting
-                        paragraph.runs[0].text = new_text
-                    else:
-                        # No runs, create one with the new text
-                        run = paragraph.add_run()
-                        run.text = new_text
-                else:
-                    # Fallback to updating the entire text_frame
-                    shape.text_frame.text = new_text
-        
-        # Update chart title
-        elif alt.get("type") == "text_title" and alt.get("table_title") == table.get("title"):
-            if hasattr(shape, "text_frame"):
-                # Preserve existing custom title - don't overwrite it with table title
+                parsed = parse_base_text(current_base_text)
+                base_n = _get_base_n(table, "Total")
+
+                desc = parsed["description"] or "Total respondents"
+                new_text = format_base_text(desc, base_n)
+                safe_update_text(shape, new_text)
+                logger.info("Updated base text for table: %s (N=%s)", table.get("title"), format_number_with_commas(base_n))
+
+        # --- Chart title ---
+        elif alt.get("type") == "text_title" and alt.get("table_title") == title_key:
+            if not hasattr(shape, "text_frame"):
+                continue
+            if table_selection and "title" in table_selection:
+                safe_update_text(shape, table_selection["title"], preserve_font=True)
+                logger.info("Updated chart title for table: %s", title_key)
+            else:
                 current_text = shape.text_frame.text
-                # Only update if the current title is the same as table title (default)
-                # This preserves custom titles that users have written
                 if current_text == table.get("title", ""):
-                    print(f"✓ Chart title already current for table: {table.get('title')}")
+                    logger.info("Chart title already current for table: %s", table.get("title"))
                 else:
-                    print(f"✓ Preserved custom chart title: {current_text}")
-                    # Don't change the text - keep the custom title
+                    logger.info("Preserved custom chart title: %s", current_text)
 
-def _update_question_and_base_with_selections(slide, table: Dict[str, Any], selections: dict, table_title: Optional[str]):
-    """Update question and base text based on alt text mapping, using current selections if available."""
-    
-    print(f"DEBUG: _update_question_and_base_with_selections called for table: {table_title}")
-    
-    # Find the selection for this specific table by matching table title
-    table_selection = None
-    if table_title and table_title in selections:
-        table_selection = selections[table_title]
-        print(f"DEBUG: Found selection for table '{table_title}': {table_selection}")
-    else:
-        print(f"⚠️ No selection found for table: {table_title}")
-        print(f"DEBUG: Available selections: {list(selections.keys()) if selections else 'None'}")
-        return
-    
-    # Find shapes by alt text type instead of name
-    shape_count = 0
+
+# ---------------------------------------------------------------------------
+# Callout update
+# ---------------------------------------------------------------------------
+
+def _update_new_text_callout_system(slide, table: Dict[str, Any], col_key: Optional[str],
+                                    selections: Optional[Dict[str, Any]] = None):
+    """Update TextCallout shapes based on alt text mapping.
+
+    When *selections* contains an entry for this table's title, the
+    ``column_key`` from selections overrides the alt-text column, and
+    callout-specific overrides (metric_type, text template) from the
+    selections ``callouts`` list are applied when matched by row_label.
+    """
+    table_title = table.get("title", "")
+    sel = selections.get(table_title, {}) if selections else {}
+    sel_callouts = sel.get("callouts", [])
+
     for shape in slide.shapes:
         alt = _parse_alt_text(shape)
-        
-        # Update question text (support both legacy 'question_text' and 'text_question')
-        if alt.get("type") in ["question_text", "text_question"] and alt.get("table_title") == table_title:
-            shape_count += 1
-            print(f"DEBUG: Found question_text shape #{shape_count} for table: {table_title}")
-            if hasattr(shape, "text_frame"):
-                # Use current selection for question text if available
-                if "question_text" in table_selection:
-                    new_text = table_selection["question_text"]
-                    print(f"DEBUG: Question text from selection: '{new_text}'")
-                    print(f"DEBUG: Current shape text before update: '{shape.text_frame.text}'")
-                    
-                    # Preserve formatting by only updating the text content
-                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                        paragraph = shape.text_frame.paragraphs[0]
-                        print(f"DEBUG: Paragraph has {len(paragraph.runs)} runs")
-                        
-                        if paragraph.runs:
-                            # Keep the first run (which has the formatting) and update its text
-                            first_run = paragraph.runs[0]
-                            first_run.text = f"Question: {new_text}"
-                            print(f"DEBUG: Updated first run text: '{first_run.text}'")
-                            
-                            # Remove any additional runs to prevent concatenation
-                            # We'll just clear the paragraph and recreate the first run with formatting
-                            if len(paragraph.runs) > 1:
-                                # Store the formatting from the first run
-                                font = first_run.font
-                                # Clear and recreate
-                                paragraph.clear()
-                                new_run = paragraph.add_run()
-                                new_run.text = f"Question: {new_text}"
-                                # Apply the formatting
-                                new_run.font.name = font.name
-                                new_run.font.size = font.size
-                                new_run.font.bold = font.bold
-                                new_run.font.italic = font.italic
-                                # Only set color if it has an rgb property
-                                if hasattr(font.color, 'rgb') and font.color.rgb is not None:
-                                    new_run.font.color.rgb = font.color.rgb
-                                print(f"DEBUG: Recreated run with preserved formatting")
-                        else:
-                            # No runs exist, create one
-                            run = paragraph.add_run()
-                            run.text = f"Question: {new_text}"
-                            print(f"DEBUG: Created new run text: '{run.text}'")
-                    else:
-                        print(f"DEBUG: No paragraphs, updating entire text_frame")
-                        shape.text_frame.text = f"Question: {new_text}"
-                        print(f"DEBUG: Text_frame text after update: '{shape.text_frame.text}'")
-                    
-                    print(f"DEBUG: Shape text after update: '{shape.text_frame.text}'")
-                    print(f"✓ Updated question text for table: {table_title} using selection: {new_text}")
-                else:
-                    print(f"⚠️ No question_text in selection for table: {table_title}")
-        
-        # Update base text
-        elif alt.get("type") == "text_base" and alt.get("table_title") == table_title:
-            shape_count += 1
-            print(f"DEBUG: Found text_base shape #{shape_count} for table: {table_title}")
-            if hasattr(shape, "text_frame"):
-                # Use current selection for base text if available
-                if "base_text" in table_selection:
-                    # Get the base text from selection
-                    base_text_template = table_selection["base_text"]
-                    
-                    # If column_key is specified in selections, update the N value from that column
-                    if "column_key" in table_selection:
-                        column_key = table_selection["column_key"]
-                        # Find the base row and selected column to get the N value
-                        base_idx = None
-                        col_idx = None
-                        
-                        # Find base row index
-                        row_labels = table.get("row_labels", [])
-                        for i, lab in enumerate(row_labels):
-                            if isinstance(lab, str) and lab.strip().lower().startswith("base"):
-                                base_idx = i
-                                break
-                        
-                        # Find column index
-                        col_labels = table.get("col_labels", [])
-                        if column_key in col_labels:
-                            col_idx = col_labels.index(column_key)
-                        
-                        # Get the new N value if both indices are found
-                        new_n_value = None
-                        if base_idx is not None and col_idx is not None and base_idx < len(table.get("values", [])):
-                            try:
-                                row_values = table["values"][base_idx]
-                                if col_idx < len(row_values):
-                                    new_n_value = int(round(float(row_values[col_idx])))
-                            except Exception:
-                                pass
-                        
-                        # Update the base text with the new N value
-                        if new_n_value is not None:
-                            # Extract the custom description from the base text template
-                            if "Base:" in base_text_template:
-                                # Look for patterns like "Base: Total respondents. 123 complete surveys."
-                                base_parts = base_text_template.split(".")
-                                if len(base_parts) >= 2:
-                                    # First part contains the custom description
-                                    custom_desc = base_parts[0].replace("Base:", "").strip()
-                                    # Clean up any trailing punctuation or equals signs
-                                    custom_desc = custom_desc.rstrip(" =").strip()
-                                    new_text = f"Base: {custom_desc}. {new_n_value:,} complete surveys."
-                                else:
-                                    # No period, might be just "Base: Total respondents 123"
-                                    base_parts = base_text_template.split()
-                                    if len(base_parts) >= 3:
-                                        # Extract everything after "Base:" but before the number
-                                        base_idx_text = base_parts.index("Base:")
-                                        if base_idx_text >= 0 and base_idx_text + 1 < len(base_parts):
-                                            # Find where the number starts
-                                            for i in range(base_idx_text + 1, len(base_parts)):
-                                                if base_parts[i].replace(",", "").isdigit():
-                                                    custom_desc = " ".join(base_parts[base_idx_text + 1:i])
-                                                    # Clean up any trailing punctuation or equals signs
-                                                    custom_desc = custom_desc.rstrip(" =").strip()
-                                                    new_text = f"Base: {custom_desc}. {new_n_value:,} complete surveys."
-                                                    break
-                                            else:
-                                                new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
-                                        else:
-                                            new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
-                                    else:
-                                        new_text = f"Base: {base_text_template.replace('Base:', '').strip()}. {new_n_value:,} complete surveys."
-                            else:
-                                new_text = f"Base: {base_text_template}. {new_n_value:,} complete surveys."
-                        else:
-                            new_text = base_text_template
-                    else:
-                        new_text = base_text_template
-                    
-                    print(f"DEBUG: Base text from selection: '{base_text_template}'")
-                    print(f"DEBUG: Final base text: '{new_text}'")
-                    print(f"DEBUG: Current shape text before update: '{shape.text_frame.text}'")
-                    
-                    # Preserve formatting by only updating the text content
-                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                        paragraph = shape.text_frame.paragraphs[0]
-                        
-                        if paragraph.runs:
-                            # Keep the first run (which has the formatting) and update its text
-                            first_run = paragraph.runs[0]
-                            first_run.text = new_text
-                            
-                            # Remove any additional runs to prevent concatenation
-                            # We'll just clear the paragraph and recreate the first run with formatting
-                            if len(paragraph.runs) > 1:
-                                # Store the formatting from the first run
-                                font = first_run.font
-                                # Clear and recreate
-                                paragraph.clear()
-                                new_run = paragraph.add_run()
-                                new_run.text = new_text
-                                # Apply the formatting
-                                new_run.font.name = font.name
-                                new_run.font.size = font.size
-                                new_run.font.bold = font.bold
-                                new_run.font.italic = font.italic
-                                # Only set color if it has an rgb property
-                                if hasattr(font.color, 'rgb') and font.color.rgb is not None:
-                                    new_run.font.color.rgb = font.color.rgb
-                        else:
-                            # No runs exist, create one
-                            run = paragraph.add_run()
-                            run.text = new_text
-                    else:
-                        shape.text_frame.text = new_text
-                    
-                    print(f"DEBUG: Shape text after update: '{shape.text_frame.text}'")
-                    print(f"✓ Updated base text for table: {table_title} using selection: {new_text}")
-                else:
-                    print(f"⚠️ No base_text in selection for table: {table_title}")
-        
-        # Update chart title
-        elif alt.get("type") == "text_title" and alt.get("table_title") == table_title:
-            shape_count += 1
-            print(f"DEBUG: Found text_title shape #{shape_count} for table: {table_title}")
-            if hasattr(shape, "text_frame"):
-                # Use current selection for chart title if available
-                if "title" in table_selection:
-                    new_text = table_selection["title"]
-                    print(f"DEBUG: Chart title from selection: '{new_text}'")
-                    print(f"DEBUG: Current shape text before update: '{shape.text_frame.text}'")
-                    
-                    # Preserve formatting by only updating the text content
-                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                        paragraph = shape.text_frame.paragraphs[0]
-                        
-                        if paragraph.runs:
-                            # Keep the first run (which has the formatting) and update its text
-                            first_run = paragraph.runs[0]
-                            first_run.text = new_text
-                            
-                            # Remove any additional runs to prevent concatenation
-                            # We'll just clear the paragraph and recreate the first run with formatting
-                            if len(paragraph.runs) > 1:
-                                # Store the formatting from the first run
-                                font = first_run.font
-                                # Clear and recreate
-                                paragraph.clear()
-                                new_run = paragraph.add_run()
-                                new_run.text = new_text
-                                # Apply the formatting
-                                new_run.font.name = font.name
-                                new_run.font.size = font.size
-                                new_run.font.bold = font.bold
-                                new_run.font.italic = font.italic
-                                # Only set color if it has an rgb property
-                                if hasattr(font.color, 'rgb') and font.color.rgb is not None:
-                                    new_run.font.color.rgb = font.color.rgb
-                        else:
-                            # No runs exist, create one
-                            run = paragraph.add_run()
-                            run.text = new_text
-                    else:
-                        shape.text_frame.text = new_text
-                    
-                    print(f"DEBUG: Shape text after update: '{shape.text_frame.text}'")
-                    print(f"✓ Updated chart title for table: {table_title} using selection: {new_text}")
-                else:
-                    print(f"⚠️ No title in selection for table: {table_title}")
-    
-    print(f"DEBUG: Total shapes updated for table '{table_title}': {shape_count}")
 
-def _update_new_text_callout_system(slide, table: Dict[str, Any], col_key: Optional[str]):
-    """Update new TextCallout objects based on alt text mapping, incorporating actual data values."""
-    for shape in slide.shapes:
-        alt = _parse_alt_text(shape)
-        
-        # Update new text callouts
-        if alt.get("type") == "text_callout" and alt.get("table_title") == table.get("title"):
-            if hasattr(shape, "text_frame"):
-                # Get callout information from alt text
-                row_label = alt.get("row", alt.get("row_label", ""))
-                column = alt.get("column", "Total")
-                metric_type = alt.get("metric_type", "percentage")
-                
-                # Get the current text from the shape to see if it has custom formatting
-                current_shape_text = shape.text_frame.text if hasattr(shape, "text_frame") else ""
-                
-                # Try to find the row and column indices
-                row_idx = None
-                col_idx = None
-                
-                if row_label:
-                    # Find row index
-                    row_labels = table.get("row_labels", [])
-                    for i, label in enumerate(row_labels):
-                        if isinstance(label, str) and row_label.lower() in label.lower():
-                            row_idx = i
-                            break
-                    
-                    # Find column index
-                    col_labels = table.get("col_labels", [])
-                    if column in col_labels:
-                        col_idx = col_labels.index(column)
-                    else:
-                        # Fallback to common column names
-                        for fallback in ["Total", "Overall", "All", "Base"]:
-                            if fallback in col_labels:
-                                col_idx = col_labels.index(fallback)
-                                break
-                        if col_idx is None:
-                            col_idx = 0 if col_labels else None
-                    
-                    # Get the actual value if both indices are found
-                    if row_idx is not None and col_idx is not None:
-                        try:
-                            values = table.get("values", [])
-                            if row_idx < len(values) and col_idx < len(values[row_idx]):
-                                value = values[row_idx][col_idx]
-                                if value is not None:
-                                    # Format the value appropriately
-                                    formatted_value = ""
-                                    if isinstance(value, (int, float)):
-                                        mt = (metric_type or "").lower()
-                                        if mt == "percentage":
-                                            formatted_value = f"{float(value) * 100:.1f}%"
-                                        elif mt == "currency":
-                                            formatted_value = f"${float(value):,.0f}"
-                                        else:
-                                            formatted_value = f"{float(value):,.1f}"
-                                    else:
-                                        formatted_value = str(value)
-                                    
-                                    # If textbox has [Value], do direct replacement
-                                    if current_shape_text and "[Value]" in current_shape_text:
-                                        new_text = current_shape_text.replace("[Value]", formatted_value)
-                                    elif current_shape_text:
-                                        # Try intelligent in-place replacement of first numeric token
-                                        import re
-                                        pattern = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?")
-                                        if pattern.search(current_shape_text):
-                                            new_text = pattern.sub(formatted_value, current_shape_text, count=1)
-                                        else:
-                                            # Fallback to prefixing with row label
-                                            new_text = f"{row_label}: {formatted_value}"
-                                    else:
-                                        new_text = f"{row_label}: {formatted_value}"
-                        except (IndexError, TypeError, AttributeError):
-                            pass
-                
-                # If no custom formatting found, use default
-                if not new_text:
-                    new_text = current_shape_text if current_shape_text else f"{row_label}: [Value]"
-                
-                # Update the text while preserving formatting
-                current_text = shape.text_frame.text
-                if current_text != new_text:
-                    if hasattr(shape.text_frame, 'paragraphs') and len(shape.text_frame.paragraphs) > 0:
-                        paragraph = shape.text_frame.paragraphs[0]
-                        if paragraph.runs:
-                            paragraph.runs[0].text = new_text
-                        else:
-                            run = paragraph.add_run()
-                            run.text = new_text
-                    else:
-                        shape.text_frame.text = new_text
-                    
-                    print(f"✓ Updated text callout '{row_label}' for table: {table.get('title')}")
+        if alt.get("type") != "text_callout" or alt.get("table_title") != table_title:
+            continue
+        if not hasattr(shape, "text_frame"):
+            continue
 
-def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str, selections: dict = None) -> str:
-    prs = Presentation(pptx_in)
-    data = parse_workbook(crosstab_xlsx)
-    
-    # Debug: Print selections if provided
-    if selections:
-        print(f"DEBUG: Selections provided: {selections}")
-        for tid, sel in selections.items():
-            print(f"DEBUG: Table ID {tid}: {sel}")
-    else:
-        print("DEBUG: No selections provided")
-    
-    # Track what was updated for reporting
-    update_log = {
-        "charts_updated": 0,
-        "tables_updated": 0,
-        "text_updated": 0,
-        "shapes_skipped": 0,
-        "mapping_issues": []
-    }
+        row_label = alt.get("row", alt.get("row_label", ""))
+        column = alt.get("column", "Total")
+        metric_type = alt.get("metric_type", "percentage")
+        current_shape_text = shape.text_frame.text if hasattr(shape, "text_frame") else ""
 
-    for slide in prs.slides:
-        for shp in slide.shapes:
-            name = shp.name or ""
-            alt = _parse_alt_text(shp)
-            
-            # Skip shapes that don't want auto-updates
-            if alt.get("auto_update", "yes").lower() == "no":
-                update_log["shapes_skipped"] += 1
-                continue
-            
-            # Handle charts - use try/except to safely check for charts
-            try:
-                # Try to access the chart property - this will raise ValueError if no chart
-                chart = shp.chart
-                # If we get here, the shape contains a chart
-                chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
-                if chart_mapping:
-                    table, col_key, exclude_terms = chart_mapping
-                    _update_chart(shp, table, col_key, explicit_rows=None, exclude_terms=exclude_terms)
-                    
-                    # Update question and base text for this table using current selections if available
-                    if selections:
-                        # Find the selection for this table by matching table title
-                        table_selection = None
-                        table_title = table.get("title")
-                        if table_title and table_title in selections:
-                            table_selection = selections[table_title]
-                            print(f"DEBUG: Found selection for table '{table_title}': {table_selection}")
-                        else:
-                            print(f"⚠️ No selection found for table: {table_title}")
-                            print(f"DEBUG: Available selections: {list(selections.keys()) if selections else 'None'}")
-                        
-                        if table_selection:
-                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
-                        else:
-                            _update_question_and_base(slide, table, None, None)
-                    else:
-                        _update_question_and_base(slide, table, None, None)
-                    
-                    # Update text callouts for this table
-                    _update_new_text_callout_system(slide, table, col_key)
-                    
-                    update_log["charts_updated"] += 1
-                    print(f"✓ Updated chart with existing mapping for table: {table.get('title')}")
-                else:
-                    # No mapping found - preserve the chart as-is
-                    print(f"⚠️ Chart '{name}' has no table mapping - preserving as-is")
-                    update_log["shapes_skipped"] += 1
-            except (ValueError, AttributeError):
-                # Shape doesn't contain a chart or doesn't have chart attribute
-                print(f"⚠️ Shape '{name}' doesn't contain a chart - skipping")
-                pass
-            
-            # Handle tables
-            if shp.has_table:
-                table = _get_table_mapping_from_shape(shp, data)
-                if table:
-                    _update_table(shp, table)
-                    
-                    # Update question and base text for this table using current selections if available
-                    if selections:
-                        # Find the selection for this table by matching table title
-                        table_selection = None
-                        table_title = table.get("title")
-                        if table_title and table_title in selections:
-                            table_selection = selections[table_title]
-                            print(f"DEBUG: Found selection for table '{table_title}': {table_selection}")
-                        else:
-                            print(f"⚠️ No selection found for table: {table_title}")
-                            print(f"DEBUG: Available selections: {list(selections.keys()) if selections else 'None'}")
-                        
-                        if table_selection:
-                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
-                        else:
-                            _update_question_and_base(slide, table, None, None)
-                    else:
-                        _update_question_and_base(slide, table, None, None)
-                    
-                    # Update text callouts for this table
-                    _update_new_text_callout_system(slide, table, None)
-                    
-                    update_log["tables_updated"] += 1
-                    print(f"✓ Updated table with existing mapping for table: {table.get('title')}")
-                else:
-                    # No mapping found - preserve the table as-is
-                    print(f"⚠️ Table '{name}' has no table mapping - preserving as-is")
-                    update_log["shapes_skipped"] += 1
-            
-            # Handle text objects (question and base)
-            elif name in ["TEXT_QUESTION", "OBJ_QUESTION"]:
-                # For text objects, we need to find which table they're bound to
-                # This could be enhanced with more sophisticated binding logic
-                update_log["text_updated"] += 1
-            elif name in ["TEXT_BASE", "OBJ_BASE"]:
-                update_log["text_updated"] += 1
-
-    # Print update summary
-    print(f"\n{'='*50}")
-    print(f"UPDATE SUMMARY")
-    print(f"{'='*50}")
-    print(f"✓ Charts updated: {update_log['charts_updated']}")
-    print(f"✓ Tables updated: {update_log['tables_updated']}")
-    print(f"✓ Text objects updated: {update_log['text_updated']}")
-    print(f"⚠️ Shapes preserved (no mapping): {update_log['shapes_skipped']}")
-    print(f"\n📋 What was updated:")
-    print(f"  • Chart/table data refreshed with new crosstab values")
-    print(f"  • Base N values updated while preserving custom descriptions")
-    print(f"  • Question text updated only if using default values")
-    print(f"  • Chart titles preserved if custom")
-    print(f"\n🔒 What was preserved:")
-    print(f"  • All formatting (fonts, colors, sizes, styles)")
-    print(f"  • Custom chart titles and question text")
-    print(f"  • Custom base descriptions")
-    print(f"  • Charts/tables without mappings")
-    print(f"{'='*50}")
-    
-    if update_log["mapping_issues"]:
-        print(f"\n⚠️ Mapping issues found: {len(update_log['mapping_issues'])}")
-        for issue in update_log["mapping_issues"][:3]:  # Show first 3 issues
-            print(f"    - {issue}")
-
-    prs.save(pptx_out)
-    return pptx_out
-
-def update_presentation_with_unmapped(pptx_in: str, crosstab_xlsx: str, pptx_out: str, 
-                                    selections: dict = None, all_tables: list = None, 
-                                    existing_content: dict = None) -> str:
-    """Enhanced update function that handles existing mappings and adds unmapped tables page."""
-    prs = Presentation(pptx_in)
-    data = parse_workbook(crosstab_xlsx)
-    
-    # Track what was updated for reporting
-    update_log = {
-        "charts_updated": 0,
-        "tables_updated": 0,
-        "text_updated": 0,
-        "shapes_skipped": 0,
-        "unmapped_tables": [],
-        "mapping_issues": []
-    }
-    
-    # Identify unmapped tables
-    mapped_table_titles = set(existing_content.keys()) if existing_content else set()
-    unmapped_tables = []
-    
-    if all_tables:
-        for table in all_tables:
-            if table["title"] not in mapped_table_titles:
-                unmapped_tables.append(table)
-        update_log["unmapped_tables"] = [t["title"] for t in unmapped_tables]
-
-    # First, update all existing mapped content (same as original function)
-    for slide in prs.slides:
-        for shp in slide.shapes:
-            name = shp.name or ""
-            alt = _parse_alt_text(shp)
-            
-            # Skip shapes that don't want auto-updates
-            if alt.get("auto_update", "yes").lower() == "no":
-                update_log["shapes_skipped"] += 1
-                continue
-            
-            # Handle charts - use try/except to safely check for charts
-            try:
-                # Try to access the chart property - this will raise ValueError if no chart
-                chart = shp.chart
-                # If we get here, the shape contains a chart
-                chart_mapping = _get_chart_mapping_from_shape(shp, data, selections)
-                if chart_mapping:
-                    table, col_key, exclude_terms = chart_mapping
-                    _update_chart(shp, table, col_key, explicit_rows=None, exclude_terms=exclude_terms)
-                    
-                    # Update question and base text for this table using current selections if available
-                    if selections:
-                        table_selection = None
-                        table_title = table.get("title")
-                        if table_title and table_title in selections:
-                            table_selection = selections[table_title]
-                        
-                        if table_selection:
-                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
-                        else:
-                            _update_question_and_base(slide, table, None, None)
-                    else:
-                        _update_question_and_base(slide, table, None, None)
-                    
-                    # Update text callouts for this table
-                    _update_new_text_callout_system(slide, table, col_key)
-                    
-                    update_log["charts_updated"] += 1
-                else:
-                    update_log["shapes_skipped"] += 1
-            except (ValueError, AttributeError):
-                # Shape doesn't contain a chart or doesn't have chart attribute
-                pass
-            
-            # Handle tables
-            if shp.has_table:
-                table = _get_table_mapping_from_shape(shp, data)
-                if table:
-                    _update_table(shp, table)
-                    
-                    # Update question and base text for this table using current selections if available
-                    if selections:
-                        table_selection = None
-                        table_title = table.get("title")
-                        if table_title and table_title in selections:
-                            table_selection = selections[table_title]
-                        
-                        if table_selection:
-                            _update_question_and_base_with_selections(slide, table, {table_title: table_selection}, table_title)
-                        else:
-                            _update_question_and_base(slide, table, None, None)
-                    else:
-                        _update_question_and_base(slide, table, None, None)
-                    
-                    # Update text callouts for this table
-                    _update_new_text_callout_system(slide, table, None)
-                    
-                    update_log["tables_updated"] += 1
-                else:
-                    update_log["shapes_skipped"] += 1
-
-    # Add unmapped tables summary page
-    if unmapped_tables:
-        from pptx_exporter import add_title, _apply_background
-        from pptx.util import Inches, Pt
-        from pptx.dml.color import RGBColor
-        
-        # Create unmapped tables summary slide
-        unmapped_slide = prs.slides.add_slide(prs.slide_layouts[5])  # Use blank layout
-        _apply_background(unmapped_slide)
-        
-        # Add title
-        add_title(unmapped_slide, "Unmapped Tables Summary")
-        
-        # Add subtitle explaining what this page contains
-        subtitle_box = unmapped_slide.shapes.add_textbox(
-            Inches(0.5), Inches(1.2), Inches(9.0), Inches(0.6)
-        )
-        subtitle_tf = subtitle_box.text_frame
-        subtitle_tf.clear()
-        subtitle_p = subtitle_tf.paragraphs[0]
-        subtitle_run = subtitle_p.add_run()
-        subtitle_run.text = f"The following {len(unmapped_tables)} tables from your crosstab had no existing connections and are listed here for reference:"
-        subtitle_run.font.size = Pt(14)
-        subtitle_run.font.name = "Arial"
-        
-        # Create a simple list of unmapped tables
-        list_y_start = 2.0
-        list_x = 0.5
-        line_height = 0.3
-        
-        for i, table in enumerate(unmapped_tables):
-            # Add table title
-            title_box = unmapped_slide.shapes.add_textbox(
-                Inches(list_x), Inches(list_y_start + i * line_height * 4), Inches(8.5), Inches(0.25)
-            )
-            title_tf = title_box.text_frame
-            title_tf.clear()
-            title_p = title_tf.paragraphs[0]
-            title_run = title_p.add_run()
-            title_run.text = f"• {table['title']}"
-            title_run.font.size = Pt(12)
-            title_run.font.bold = True
-            title_run.font.name = "Arial"
-            
-            # Add basic stats
-            stats_box = unmapped_slide.shapes.add_textbox(
-                Inches(list_x + 0.3), Inches(list_y_start + i * line_height * 4 + 0.25), Inches(8.2), Inches(0.2)
-            )
-            stats_tf = stats_box.text_frame
-            stats_tf.clear()
-            stats_p = stats_tf.paragraphs[0]
-            stats_run = stats_p.add_run()
-            
-            row_count = len(table.get("row_labels", []))
-            col_count = len(table.get("col_labels", []))
-            stats_run.text = f"  Rows: {row_count}, Columns: {col_count}"
-            stats_run.font.size = Pt(10)
-            stats_run.font.name = "Arial"
-            stats_run.font.color.rgb = RGBColor(100, 100, 100)
-            
-            # Add column names
-            if table.get("col_labels"):
-                cols_text = ", ".join(table["col_labels"][:8])  # Show first 8 columns
-                if len(table["col_labels"]) > 8:
-                    cols_text += "..."
-                
-                cols_box = unmapped_slide.shapes.add_textbox(
-                    Inches(list_x + 0.3), Inches(list_y_start + i * line_height * 4 + 0.45), Inches(8.2), Inches(0.2)
-                )
-                cols_tf = cols_box.text_frame
-                cols_tf.clear()
-                cols_p = cols_tf.paragraphs[0]
-                cols_run = cols_p.add_run()
-                cols_run.text = f"  Columns: {cols_text}"
-                cols_run.font.size = Pt(9)
-                cols_run.font.name = "Arial"
-                cols_run.font.color.rgb = RGBColor(120, 120, 120)
-            
-            # Stop if we're running out of space (about 12 tables max)
-            if i >= 11:
-                remaining_count = len(unmapped_tables) - 12
-                if remaining_count > 0:
-                    more_box = unmapped_slide.shapes.add_textbox(
-                        Inches(list_x), Inches(list_y_start + 12 * line_height * 4), Inches(8.5), Inches(0.25)
-                    )
-                    more_tf = more_box.text_frame
-                    more_tf.clear()
-                    more_p = more_tf.paragraphs[0]
-                    more_run = more_p.add_run()
-                    more_run.text = f"... and {remaining_count} more tables"
-                    more_run.font.size = Pt(11)
-                    more_run.font.italic = True
-                    more_run.font.name = "Arial"
-                    more_run.font.color.rgb = RGBColor(150, 150, 150)
+        # Apply selection-level overrides for this callout
+        if col_key:
+            column = col_key
+        for sc in sel_callouts:
+            if sc.get("row_label") == row_label:
+                if sc.get("column_key"):
+                    column = sc["column_key"]
+                if sc.get("metric_type"):
+                    metric_type = sc["metric_type"]
+                if sc.get("text"):
+                    current_shape_text = sc["text"]
                 break
 
-    # Print update summary
-    print(f"\n{'='*60}")
-    print(f"ENHANCED UPDATE SUMMARY")
-    print(f"{'='*60}")
-    print(f"✓ Charts updated: {update_log['charts_updated']}")
-    print(f"✓ Tables updated: {update_log['tables_updated']}")
-    print(f"✓ Text objects updated: {update_log['text_updated']}")
-    print(f"⚠️ Shapes preserved (no mapping): {update_log['shapes_skipped']}")
-    print(f"📄 Unmapped tables added to summary page: {len(unmapped_tables)}")
-    
+        row_idx = None
+        col_idx = None
+        new_text = ""
+
+        if row_label:
+            row_labels = table.get("row_labels", [])
+            for i, label in enumerate(row_labels):
+                if isinstance(label, str) and row_label.lower() in label.lower():
+                    row_idx = i
+                    break
+
+            col_labels = table.get("col_labels", [])
+            if column in col_labels:
+                col_idx = col_labels.index(column)
+            else:
+                for fallback in ["Total", "Overall", "All", "Base"]:
+                    if fallback in col_labels:
+                        col_idx = col_labels.index(fallback)
+                        break
+                if col_idx is None:
+                    col_idx = 0 if col_labels else None
+
+            if row_idx is not None and col_idx is not None:
+                try:
+                    values = table.get("values", [])
+                    if row_idx < len(values) and col_idx < len(values[row_idx]):
+                        value = values[row_idx][col_idx]
+                        if value is not None:
+                            formatted_value = ""
+                            if isinstance(value, (int, float)):
+                                mt = (metric_type or "").lower()
+                                if mt == "percentage":
+                                    formatted_value = f"{float(value) * 100:.1f}%"
+                                elif mt == "currency":
+                                    formatted_value = f"${float(value):,.0f}"
+                                else:
+                                    formatted_value = f"{float(value):,.1f}"
+                            else:
+                                formatted_value = str(value)
+
+                            if current_shape_text and "[Value]" in current_shape_text:
+                                new_text = current_shape_text.replace("[Value]", formatted_value)
+                            elif current_shape_text:
+                                pattern = re.compile(r"[-+]?\d{1,3}(?:,\d{3})*(?:\.\d+)?%?")
+                                if pattern.search(current_shape_text):
+                                    new_text = pattern.sub(formatted_value, current_shape_text, count=1)
+                                else:
+                                    new_text = f"{row_label}: {formatted_value}"
+                            else:
+                                new_text = f"{row_label}: {formatted_value}"
+                except (IndexError, TypeError, AttributeError):
+                    pass
+
+        if not new_text:
+            new_text = current_shape_text if current_shape_text else f"{row_label}: [Value]"
+
+        current_text = shape.text_frame.text
+        if current_text != new_text:
+            safe_update_text(shape, new_text)
+            logger.info("Updated text callout '%s' for table: %s", row_label, table.get("title"))
+
+
+# ---------------------------------------------------------------------------
+# Core slide-processing loop (shared by both entry points)
+# ---------------------------------------------------------------------------
+
+def _process_slides(prs, data: Dict[str, Any], selections: Optional[dict] = None,
+                    matcher: Optional[SmartMatcher] = None,
+                    progress_callback=None) -> dict:
+    """Walk all slides/shapes, update charts/tables/text, return update counts.
+
+    *progress_callback*, when provided, is called with a float 0.0–1.0
+    after each slide is processed.
+    """
+    if matcher is None:
+        matcher = SmartMatcher(data["tables"])
+
+    update_log = {
+        "charts_updated": 0,
+        "tables_updated": 0,
+        "text_updated": 0,
+        "shapes_skipped": 0,
+        "matched_titles": set(),
+        "match_report": [],
+    }
+
+    slides = list(prs.slides)
+    total_slides = len(slides) or 1
+
+    for slide_idx, slide in enumerate(slides):
+        for shp in slide.shapes:
+            name = shp.name or ""
+            alt = _parse_alt_text(shp)
+
+            if alt.get("auto_update", "yes").lower() == "no":
+                update_log["shapes_skipped"] += 1
+                continue
+
+            # --- Charts ---
+            try:
+                _chart_obj = shp.chart  # noqa: F841 — access triggers AttributeError for non-charts
+                mapping = _match_shape(matcher, shp, selections)
+                if mapping:
+                    table, col_key, exclude_terms = mapping
+                    sel_col_keys = None
+                    table_title = table.get("title")
+                    if selections and table_title and table_title in selections:
+                        sel_col_keys = selections[table_title].get("column_keys")
+                    _update_chart(shp, table, col_key, explicit_rows=None,
+                                  exclude_terms=exclude_terms, column_keys=sel_col_keys)
+
+                    sel_for_qb = None
+                    table_title = table.get("title")
+                    if selections and table_title and table_title in selections:
+                        sel_for_qb = selections
+
+                    _update_question_and_base(slide, table, sel_for_qb, table_title)
+                    _update_new_text_callout_system(slide, table, col_key, selections)
+
+                    update_log["charts_updated"] += 1
+                    update_log["matched_titles"].add(table_title)
+                    logger.info("Updated chart with mapping for table: %s", table_title)
+                else:
+                    logger.debug("Chart '%s' has no table mapping - preserving as-is", name)
+                    update_log["shapes_skipped"] += 1
+            except (ValueError, AttributeError):
+                pass
+
+            # --- Tables ---
+            if shp.has_table:
+                mapping = _match_shape(matcher, shp, selections)
+                if mapping:
+                    table, col_key, exclude_terms = mapping
+                    _update_table(shp, table)
+
+                    sel_for_qb = None
+                    table_title = table.get("title")
+                    if selections and table_title and table_title in selections:
+                        sel_for_qb = selections
+
+                    _update_question_and_base(slide, table, sel_for_qb, table_title)
+
+                    callout_col = col_key
+                    if selections and table_title and table_title in selections:
+                        callout_col = selections[table_title].get("column_key") or col_key
+                    _update_new_text_callout_system(slide, table, callout_col, selections)
+
+                    update_log["tables_updated"] += 1
+                    update_log["matched_titles"].add(table_title)
+                    logger.info("Updated table with mapping for table: %s", table_title)
+                else:
+                    logger.debug("Table '%s' has no table mapping - preserving as-is", name)
+                    update_log["shapes_skipped"] += 1
+
+            # Legacy named text objects
+            if name in ("TEXT_QUESTION", "OBJ_QUESTION", "TEXT_BASE", "OBJ_BASE"):
+                update_log["text_updated"] += 1
+
+        if progress_callback:
+            progress_callback((slide_idx + 1) / total_slides)
+
+    update_log["match_report"] = matcher.get_report()
+    return update_log
+
+
+def _log_update_summary(update_log: dict, unmapped_tables: Optional[list] = None):
+    """Emit a structured update summary to the logger."""
+    logger.info("=" * 50)
+    logger.info("UPDATE SUMMARY")
+    logger.info("=" * 50)
+    logger.info("Charts updated: %d", update_log["charts_updated"])
+    logger.info("Tables updated: %d", update_log["tables_updated"])
+    logger.info("Text objects updated: %d", update_log["text_updated"])
+    logger.info("Shapes preserved (no mapping): %d", update_log["shapes_skipped"])
+
     if unmapped_tables:
-        print(f"\n📋 Unmapped tables:")
-        for table in unmapped_tables[:5]:  # Show first 5
-            print(f"  • {table['title']}")
+        logger.info("Unmapped tables added to summary page: %d", len(unmapped_tables))
+        for t in unmapped_tables[:5]:
+            logger.info("  - %s", t["title"])
         if len(unmapped_tables) > 5:
-            print(f"  ... and {len(unmapped_tables) - 5} more")
-    
-    print(f"\n📋 What was updated:")
-    print(f"  • Existing chart/table data refreshed with new crosstab values")
-    print(f"  • Base N values updated while preserving custom descriptions")
-    print(f"  • Question text updated only if using default values")
-    print(f"  • Chart titles preserved if custom")
-    print(f"  • New 'Unmapped Tables Summary' page added with {len(unmapped_tables)} tables")
-    print(f"\n🔒 What was preserved:")
-    print(f"  • All formatting (fonts, colors, sizes, styles)")
-    print(f"  • Custom chart titles and question text")
-    print(f"  • Custom base descriptions")
-    print(f"  • Charts/tables without mappings")
-    print(f"{'='*60}")
+            logger.info("  ... and %d more", len(unmapped_tables) - 5)
+
+    logger.info("=" * 50)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def update_presentation(pptx_in: str, crosstab_xlsx: str, pptx_out: str,
+                        selections: dict = None,
+                        all_tables: list = None,
+                        existing_content: dict = None,
+                        include_unmapped_summary: bool = False,
+                        matcher: Optional[SmartMatcher] = None,
+                        progress_callback=None) -> str:
+    """Update an existing PowerPoint with new crosstab data.
+
+    Args:
+        selections: Optional mapping keyed by **table title** (not id)::
+
+            {table_title: {"column_key": str, "title": str,
+                           "base_text": str, "question_text": str,
+                           "callouts": list, "chart_type": str,
+                           "enable_sorting": bool, "excluded_rows": list}}
+
+        matcher: Optional pre-configured ``SmartMatcher``.  When *None*,
+            one is created internally from the parsed workbook tables.
+
+        progress_callback: Optional callable(float) invoked with 0.0–1.0
+            progress after each slide.
+
+        When *include_unmapped_summary* is True and *all_tables* /
+        *existing_content* are provided, tables not present in the
+        existing deck are listed on an appended summary slide.
+    """
+    prs = Presentation(pptx_in)
+    data = parse_workbook(crosstab_xlsx)
+
+    if matcher is None:
+        matcher = SmartMatcher(data["tables"])
+
+    if selections:
+        logger.debug("Selections provided: %s", list(selections.keys()))
+
+    update_log = _process_slides(prs, data, selections, matcher=matcher,
+                                 progress_callback=progress_callback)
+
+    # --- Unmapped tables summary slide ---
+    unmapped_tables = []
+    if include_unmapped_summary and all_tables and existing_content is not None:
+        mapped_titles = set(existing_content.keys()) if existing_content else set()
+        unmapped_tables = [t for t in all_tables if t["title"] not in mapped_titles]
+
+        if unmapped_tables:
+            _add_unmapped_summary_slide(prs, unmapped_tables)
+
+    _log_update_summary(update_log, unmapped_tables if include_unmapped_summary else None)
 
     prs.save(pptx_out)
     return pptx_out
+
+
+def update_presentation_with_unmapped(pptx_in: str, crosstab_xlsx: str, pptx_out: str,
+                                      selections: dict = None,
+                                      all_tables: list = None,
+                                      existing_content: dict = None,
+                                      matcher: Optional[SmartMatcher] = None,
+                                      progress_callback=None) -> str:
+    """Convenience wrapper — calls update_presentation with unmapped summary enabled."""
+    return update_presentation(
+        pptx_in, crosstab_xlsx, pptx_out,
+        selections=selections,
+        all_tables=all_tables,
+        existing_content=existing_content,
+        include_unmapped_summary=True,
+        matcher=matcher,
+        progress_callback=progress_callback,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Unmapped tables summary slide
+# ---------------------------------------------------------------------------
+
+def _add_unmapped_summary_slide(prs, unmapped_tables: list):
+    """Append a slide listing tables that had no shape match in the deck."""
+    from pptx.util import Inches, Pt
+    from pptx.dml.color import RGBColor
+
+    unmapped_slide = prs.slides.add_slide(prs.slide_layouts[5])
+
+    title_box = unmapped_slide.shapes.add_textbox(Inches(0.5), Inches(0.4), Inches(9.0), Inches(0.6))
+    tf = title_box.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    run = p.add_run()
+    run.text = "Unmapped Tables Summary"
+    run.font.size = Pt(24)
+    run.font.bold = True
+    run.font.name = "Arial"
+
+    subtitle_box = unmapped_slide.shapes.add_textbox(Inches(0.5), Inches(1.2), Inches(9.0), Inches(0.6))
+    stf = subtitle_box.text_frame
+    stf.clear()
+    sp = stf.paragraphs[0]
+    srun = sp.add_run()
+    srun.text = (
+        f"The following {len(unmapped_tables)} tables from your crosstab had no "
+        "existing connections and are listed here for reference:"
+    )
+    srun.font.size = Pt(14)
+    srun.font.name = "Arial"
+
+    list_y_start = 2.0
+    line_height = 0.3
+
+    for i, table in enumerate(unmapped_tables):
+        title_box = unmapped_slide.shapes.add_textbox(
+            Inches(0.5), Inches(list_y_start + i * line_height * 4), Inches(8.5), Inches(0.25)
+        )
+        ttf = title_box.text_frame
+        ttf.clear()
+        tp = ttf.paragraphs[0]
+        trun = tp.add_run()
+        trun.text = f"\u2022 {table['title']}"
+        trun.font.size = Pt(12)
+        trun.font.bold = True
+        trun.font.name = "Arial"
+
+        stats_box = unmapped_slide.shapes.add_textbox(
+            Inches(0.8), Inches(list_y_start + i * line_height * 4 + 0.25), Inches(8.2), Inches(0.2)
+        )
+        stats_tf = stats_box.text_frame
+        stats_tf.clear()
+        stats_p = stats_tf.paragraphs[0]
+        stats_run = stats_p.add_run()
+        row_count = len(table.get("row_labels", []))
+        col_count = len(table.get("col_labels", []))
+        stats_run.text = f"  Rows: {row_count}, Columns: {col_count}"
+        stats_run.font.size = Pt(10)
+        stats_run.font.name = "Arial"
+        stats_run.font.color.rgb = RGBColor(100, 100, 100)
+
+        if table.get("col_labels"):
+            cols_text = ", ".join(table["col_labels"][:8])
+            if len(table["col_labels"]) > 8:
+                cols_text += "..."
+            cols_box = unmapped_slide.shapes.add_textbox(
+                Inches(0.8), Inches(list_y_start + i * line_height * 4 + 0.45), Inches(8.2), Inches(0.2)
+            )
+            cols_tf = cols_box.text_frame
+            cols_tf.clear()
+            cols_p = cols_tf.paragraphs[0]
+            cols_run = cols_p.add_run()
+            cols_run.text = f"  Columns: {cols_text}"
+            cols_run.font.size = Pt(9)
+            cols_run.font.name = "Arial"
+            cols_run.font.color.rgb = RGBColor(120, 120, 120)
+
+        if i >= 11:
+            remaining = len(unmapped_tables) - 12
+            if remaining > 0:
+                more_box = unmapped_slide.shapes.add_textbox(
+                    Inches(0.5), Inches(list_y_start + 12 * line_height * 4), Inches(8.5), Inches(0.25)
+                )
+                more_tf = more_box.text_frame
+                more_tf.clear()
+                more_p = more_tf.paragraphs[0]
+                more_run = more_p.add_run()
+                more_run.text = f"... and {remaining} more tables"
+                more_run.font.size = Pt(11)
+                more_run.font.italic = True
+                more_run.font.name = "Arial"
+                more_run.font.color.rgb = RGBColor(150, 150, 150)
+            break

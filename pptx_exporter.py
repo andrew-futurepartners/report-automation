@@ -5,12 +5,15 @@ Branding sourced entirely from brand_config.py.
 """
 
 import json
+import logging
 import os
 import zipfile
 from copy import deepcopy
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 from lxml import etree
+
+logger = logging.getLogger("report_relay.pptx_exporter")
 
 from pptx import Presentation
 from pptx.util import Inches, Pt, Emu
@@ -34,6 +37,7 @@ from brand_config import (
     SLIDE_WIDTH_IN, SLIDE_HEIGHT_IN,
     TEMPLATE_PATH, LAYOUT, PH, CHART_TEMPLATES_DIR,
 )
+from chart_data_patcher import detect_value_format
 
 
 # ---------------------------------------------------------------------------
@@ -279,8 +283,7 @@ def _apply_crtx_template(chart_part, chart_kind: str):
 
         return True
     except Exception as e:
-        print(f"Warning: Could not apply .crtx template for '{chart_kind}': {e}")
-        import traceback; traceback.print_exc()
+        logger.warning("Could not apply .crtx template for '%s': %s", chart_kind, e, exc_info=True)
         return False
 
 
@@ -377,7 +380,7 @@ def _set_alt_text(shape, mapping: dict):
             if hasattr(shape, "alternative_text"):
                 shape.alternative_text = alt_text_content
                 return
-        except Exception:
+        except (AttributeError, ValueError):
             pass
         try:
             if hasattr(shape, "element"):
@@ -390,16 +393,33 @@ def _set_alt_text(shape, mapping: dict):
                 if c_nv_pr is not None:
                     c_nv_pr.set("descr", alt_text_content)
                     return
-        except Exception:
+        except (AttributeError, TypeError):
             pass
-    except Exception:
+    except (AttributeError, TypeError, KeyError):
         pass
 
 
 def _tag_shape(shape, obj_type: str, table_title: str, col_key=None,
                bind_question="TEXT_QUESTION", bind_base="TEXT_BASE",
-               row_label=None, metric_type=None):
+               row_label=None, metric_type=None,
+               row_labels=None, col_labels=None,
+               sheet_name=None, block_index=None,
+               value_format=None):
     base = {"table_title": table_title, "column": col_key or "Total", "auto_update": "yes"}
+
+    if row_labels is not None:
+        from smart_match import label_hash
+        base["row_hash"] = label_hash(row_labels)
+    if col_labels is not None:
+        from smart_match import label_hash
+        base["col_hash"] = label_hash(col_labels)
+    if sheet_name:
+        base["sheet_name"] = sheet_name
+    if block_index is not None:
+        base["block_index"] = str(block_index)
+    if value_format:
+        base["value_format"] = value_format
+
     type_map = {
         "chart":           {"type": "chart", "exclude_rows": "base, mean, average, avg"},
         "table":           {"type": "table", "columns": "*", "exclude_rows": "base, mean, average, avg"},
@@ -498,13 +518,13 @@ def _apply_chart_formatting(chart, palette_name: str, n_series: int,
         if not is_pie_type:
             try:
                 s.data_labels.position = 2
-            except Exception:
+            except (AttributeError, ValueError):
                 pass
         try:
             s.data_labels.font.name = FONT_BODY
             s.data_labels.font.size = FONT_SIZE["data_label"]
             s.data_labels.font.bold = True
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
     if not is_pie_type:
@@ -512,14 +532,14 @@ def _apply_chart_formatting(chart, palette_name: str, n_series: int,
             chart.plots[0].gap_width = CHART_DEFAULTS["gap_width"]
             if n_series > 1:
                 chart.plots[0].overlap = CHART_DEFAULTS["overlap"]
-        except Exception:
+        except (AttributeError, IndexError, TypeError):
             pass
 
         try:
             gl = chart.value_axis.major_gridlines
             gl.format.line.width = Pt(0.5)
             gl.format.line.fore_color.rgb = GRIDLINE_COLOR
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
         try:
@@ -529,7 +549,7 @@ def _apply_chart_formatting(chart, palette_name: str, n_series: int,
             chart.category_axis.tick_labels.font.name = FONT_BODY
             chart.value_axis.tick_labels.font.size = FONT_SIZE["axis"]
             chart.value_axis.tick_labels.font.name = FONT_BODY
-        except Exception:
+        except (AttributeError, TypeError):
             pass
 
     colors = get_chart_colors(n_series, palette_name)
@@ -712,6 +732,16 @@ def add_chart_slide(prs, table: Dict[str, Any], chart_kind="bar_h",
     if qbase_text:
         _fill_placeholder_text(slide, PH["qbase"], qbase_text, "text_question", table_title)
 
+    # --- Metadata for enriched alt text ---
+    _sheet_name = working_table.get("sheet")
+    _block_index = None
+    _tid = working_table.get("id", "")
+    if "#" in _tid:
+        try:
+            _block_index = int(_tid.rsplit("#", 1)[1])
+        except (ValueError, IndexError):
+            pass
+
     # --- Build chart data ---
     row_labels = working_table["row_labels"]
     col_labels = working_table["col_labels"]
@@ -772,20 +802,26 @@ def add_chart_slide(prs, table: Dict[str, Any], chart_kind="bar_h",
 
         _apply_crtx_template(chart_shape.chart_part, chart_kind)
         _apply_chart_formatting(chart, palette_name, n_series, value_sample, chart_kind)
+        _detected_vf = detect_value_format(value_sample)
         _tag_shape(chart_frame, "chart", table_title,
-                   series_cols[0] if len(series_cols) == 1 else ",".join(series_cols))
+                   series_cols[0] if len(series_cols) == 1 else ",".join(series_cols),
+                   row_labels=row_labels, col_labels=col_labels,
+                   sheet_name=_sheet_name, block_index=_block_index,
+                   value_format=_detected_vf)
 
     elif chart_kind.lower() in ("table_only", "table only"):
-        # Table-only slide: put table in the chart placeholder area
         tbl = _add_data_table(slide, col_labels, row_labels, values,
                               position=(5.51, 1.64, 6.92, 4.43))
-        _tag_shape(tbl, "table", table_title)
+        _tag_shape(tbl, "table", table_title,
+                   row_labels=row_labels, col_labels=col_labels,
+                   sheet_name=_sheet_name, block_index=_block_index)
 
-    # For chart+table layout, add a table as well
     if layout_key == "one_two_third_alt" and xl_type is not None:
         tbl = _add_data_table(slide, col_labels, row_labels, values,
                               position=(5.60, 1.85, 6.82, 3.24))
-        _tag_shape(tbl, "table", table_title)
+        _tag_shape(tbl, "table", table_title,
+                   row_labels=row_labels, col_labels=col_labels,
+                   sheet_name=_sheet_name, block_index=_block_index)
 
     # Callouts
     if callouts:

@@ -8,21 +8,91 @@ Usage:
     from ai_insights import generate_table_insights, generate_all_insights
 """
 
+import hashlib
 import json
+import logging
 import os
+import time
 from dotenv import load_dotenv
 from typing import Dict, Any, List, Optional
 
+from brand_config import AI_GENERATION
+
+logger = logging.getLogger("report_relay.ai_insights")
+
 load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# File-based insight cache
+# ---------------------------------------------------------------------------
+
+def _cache_dir() -> str:
+    return AI_GENERATION.get("cache_dir", ".ai_cache")
+
+
+def _cache_key(table: Dict[str, Any], column_key: str) -> str:
+    """Deterministic hash of table data + column key for cache lookup."""
+    payload = json.dumps(
+        {
+            "title": table.get("title", ""),
+            "row_labels": table.get("row_labels", []),
+            "col_labels": table.get("col_labels", []),
+            "values": table.get("values", []),
+            "column_key": column_key,
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _read_cache(key: str) -> Optional[Dict[str, str]]:
+    path = os.path.join(_cache_dir(), f"{key}.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"takeaway": data.get("takeaway", ""), "analysis": data.get("analysis", "")}
+    except (FileNotFoundError, json.JSONDecodeError, KeyError):
+        return None
+
+
+def _write_cache(key: str, insights: Dict[str, str], model: str, column_key: str) -> None:
+    cdir = _cache_dir()
+    os.makedirs(cdir, exist_ok=True)
+    path = os.path.join(cdir, f"{key}.json")
+    try:
+        payload = {
+            **insights,
+            "_model": model,
+            "_column_key": column_key,
+            "_timestamp": time.time(),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+    except OSError as e:
+        logger.warning("Failed to write insight cache %s: %s", path, e)
 
 
 # ---------------------------------------------------------------------------
 # Core two-tier generator
 # ---------------------------------------------------------------------------
 
-def generate_table_insights(table: Dict[str, Any], column_key: str = "Total") -> Dict[str, str]:
+def generate_table_insights(
+    table: Dict[str, Any],
+    column_key: str = "Total",
+    use_cache: bool = True,
+    old_table: Optional[Dict[str, Any]] = None,
+) -> Dict[str, str]:
     """
     Generate two tiers of insight for a single crosstab table.
+
+    Args:
+        use_cache: When True, check the file cache before calling the API
+            and persist new results.
+        old_table: Optional previous-wave table dict.  When provided the
+            prompt includes both old and new data so the LLM can highlight
+            wave-over-wave changes.
 
     Returns:
         {"takeaway": str, "analysis": str}
@@ -30,33 +100,41 @@ def generate_table_insights(table: Dict[str, Any], column_key: str = "Total") ->
     """
     empty = {"takeaway": "", "analysis": ""}
 
+    # Skip cache when wave-over-wave context is supplied (results are unique)
+    cache_hit_key = _cache_key(table, column_key) if (use_cache and not old_table) else None
+    if cache_hit_key:
+        cached = _read_cache(cache_hit_key)
+        if cached:
+            logger.debug("Cache hit for '%s' (%s)", table.get("title"), column_key)
+            return cached
+
     try:
         from openai import OpenAI
     except ImportError:
-        print("openai package not installed. Run: pip install openai")
+        logger.error("openai package not installed. Run: pip install openai")
         return empty
 
     table_text = _format_table_for_prompt(table, column_key)
     if not table_text:
         return empty
 
-    system_msg = (
-        "You are a senior research analyst at a creative insights firm specializing in "
-        "travel, tourism, and hospitality. You write with the confident, clear voice of "
-        "an experienced analyst — professional yet conversational. "
-        "Ground every statement in specific data: percentages, averages, and segment "
-        "differences. Interpret the numbers — explain what they mean and why they matter "
-        "for destination marketers and tourism stakeholders. "
-        "Write in present tense. Use active language. "
-        "Never use filler phrases like 'the data shows', 'it is clear that', or "
-        "'interestingly'. Never mention that you are an AI. "
-        "Avoid jargon. Highlight differences by segment where meaningful."
-    )
+    system_msg = AI_GENERATION.get("system_prompt", "")
+    if old_table:
+        system_msg += AI_GENERATION.get("system_prompt_wave", "")
+
+    wave_section = ""
+    if old_table:
+        old_text = _format_table_for_prompt(old_table, column_key)
+        if old_text:
+            wave_section = (
+                f"\n\n--- Previous wave data (same table) ---\n{old_text}\n"
+                "--- End previous wave ---\n"
+            )
 
     user_msg = f"""Below is data from a crosstab table titled "{table['title']}".
 Column shown: {column_key}
 
-{table_text}
+{table_text}{wave_section}
 
 Produce exactly two outputs as a JSON object with these keys:
 
@@ -66,24 +144,34 @@ Produce exactly two outputs as a JSON object with these keys:
 
 Return ONLY the JSON object, no other text."""
 
+    model = os.getenv("AI_MODEL") or AI_GENERATION.get("model", "gpt-4o-mini")
+    max_tokens = AI_GENERATION.get("max_tokens", 250)
+    temperature = AI_GENERATION.get("temperature")
+
     try:
         client = OpenAI()
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            max_tokens=250,
-            response_format={"type": "json_object"},
-            messages=[
+        api_kwargs: Dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "response_format": {"type": "json_object"},
+            "messages": [
                 {"role": "system", "content": system_msg},
                 {"role": "user", "content": user_msg},
             ],
-        )
+        }
+        if temperature is not None:
+            api_kwargs["temperature"] = temperature
+        response = client.chat.completions.create(**api_kwargs)
         result = json.loads(response.choices[0].message.content)
-        return {
+        insights = {
             "takeaway": result.get("takeaway", ""),
             "analysis": result.get("analysis", ""),
         }
+        if cache_hit_key:
+            _write_cache(cache_hit_key, insights, model, column_key)
+        return insights
     except Exception as e:
-        print(f"Warning: AI insight generation failed for '{table.get('title')}': {e}")
+        logger.error("AI insight generation failed for '%s': %s", table.get("title"), e)
         return empty
 
 
@@ -91,26 +179,52 @@ def generate_all_insights(
     tables: List[Dict[str, Any]],
     column_key: str = "Total",
     selections: Optional[Dict[str, Dict]] = None,
+    use_cache: bool = True,
+    old_tables: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, str]]:
     """
-    Generate two-tier insights for every table.
+    Generate two-tier insights for every table using parallel API calls.
+
+    Args:
+        old_tables: Optional dict keyed by table title mapping to previous-wave
+            table dicts.  When supplied, the matching old table is forwarded to
+            ``generate_table_insights`` for wave-over-wave commentary.
 
     Returns:
         Dict mapping table title -> {"takeaway", "analysis"}
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     insights: Dict[str, Dict[str, str]] = {}
     sel_by_id = selections or {}
+    old_map = old_tables or {}
 
+    tasks: List[tuple] = []
     for table in tables:
         col = column_key
         if sel_by_id:
             tid = table.get("id", "")
             sel = sel_by_id.get(tid, {})
             col = sel.get("column_key") or sel.get("banner_key") or column_key
-
         title = table.get("title", "")
-        print(f"Generating insights for: {title} ({col})")
-        insights[title] = generate_table_insights(table, col)
+        old_tbl = old_map.get(title)
+        tasks.append((table, col, title, old_tbl))
+
+    max_workers = AI_GENERATION.get("max_concurrent", 5)
+    logger.info("Generating insights for %d tables (max_concurrent=%d)", len(tasks), max_workers)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {
+            pool.submit(generate_table_insights, tbl, col, use_cache, old_tbl): title
+            for tbl, col, title, old_tbl in tasks
+        }
+        for future in as_completed(futures):
+            title = futures[future]
+            try:
+                insights[title] = future.result()
+            except Exception as e:
+                logger.error("Insight generation failed for '%s': %s", title, e)
+                insights[title] = {"takeaway": "", "analysis": ""}
 
     return insights
 
@@ -129,9 +243,10 @@ def generate_all_summaries(
     tables: List[Dict[str, Any]],
     column_key: str = "Total",
     selections: Optional[Dict[str, Dict]] = None,
+    use_cache: bool = True,
 ) -> Dict[str, str]:
     """Legacy wrapper — returns {title: analysis_string}."""
-    full = generate_all_insights(tables, column_key, selections)
+    full = generate_all_insights(tables, column_key, selections, use_cache=use_cache)
     return {title: tiers.get("analysis", "") for title, tiers in full.items()}
 
 
@@ -243,7 +358,8 @@ if __name__ == "__main__":
             [1448,  548,   600,   300],
         ],
     }
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(name)s | %(message)s")
     result = generate_table_insights(test_table, "Total")
-    print("\nGenerated insights:")
+    logger.info("Generated insights:")
     for k, v in result.items():
-        print(f"  {k}: {v}")
+        logger.info("  %s: %s", k, v)

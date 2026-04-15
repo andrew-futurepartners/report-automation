@@ -28,6 +28,9 @@ to_update.pptx
 updated_report.pptx
 report.pptx
 
+# AI insight cache
+.ai_cache/
+
 # Stale root-level template copy
 /Template_ReportSlides.pptx
 

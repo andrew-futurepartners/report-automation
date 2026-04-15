@@ -9,10 +9,14 @@ It can be used to:
 4. Validate existing mappings
 """
 
+import json
+import logging
+from typing import Dict, Any, List
+
 from pptx import Presentation
 from crosstab_parser import parse_workbook
-import json
-from typing import Dict, Any, List
+
+logger = logging.getLogger("report_relay.mapping_helper")
 
 def list_all_shapes(pptx_path: str) -> List[Dict[str, Any]]:
     """List all shapes in a PowerPoint file with their current mapping status."""
@@ -26,7 +30,7 @@ def list_all_shapes(pptx_path: str) -> List[Dict[str, Any]]:
             try:
                 if hasattr(shape, "chart") and shape.chart is not None:
                     has_chart = True
-            except:
+            except (ValueError, AttributeError):
                 pass
             
             # Check if shape has table
@@ -34,7 +38,7 @@ def list_all_shapes(pptx_path: str) -> List[Dict[str, Any]]:
             try:
                 if hasattr(shape, "has_table") and shape.has_table:
                     has_table = True
-            except:
+            except (ValueError, AttributeError):
                 pass
             
             shape_info = {
@@ -80,11 +84,11 @@ def list_all_shapes(pptx_path: str) -> List[Dict[str, Any]]:
                 if not alt_text:
                     try:
                         alt_text = shape.alternative_text or ""
-                    except:
+                    except (AttributeError, ValueError):
                         alt_text = ""
                 
                 shape_info["alt_text"] = alt_text
-            except:
+            except Exception:
                 shape_info["alt_text"] = ""
             
             # Determine mapping status
@@ -102,61 +106,61 @@ def generate_mapping_template(pptx_path: str, crosstab_path: str = None) -> str:
     """Generate a mapping template that can be manually edited."""
     shapes_info = list_all_shapes(pptx_path)
     
-    template = "# PowerPoint Mapping Template\n\n"
-    template += "# Instructions:\n"
-    template += "# 1. Edit the mapping values below\n"
-    template += "# 2. Save this file\n"
-    template += "# 3. Use the apply_mapping function to update your PowerPoint\n\n"
-    
+    available_tables = []
     if crosstab_path:
         try:
             data = parse_workbook(crosstab_path)
-            template += f"# Available crosstab tables:\n"
             for table in data["tables"]:
-                template += f"# - {table['title']} (columns: {', '.join(table['col_labels'])})\n"
-            template += "\n"
-        except Exception as e:
-            template += f"# Could not parse crosstab: {e}\n\n"
-    
-    template += "MAPPINGS = {\n"
-    
+                available_tables.append({
+                    "title": table["title"],
+                    "columns": table["col_labels"]
+                })
+        except Exception:
+            pass
+
+    mappings = {}
     for shape in shapes_info:
         if shape["type"] in ["chart", "table"]:
-            template += f"    # Slide {shape['slide']}, Shape {shape['shape_num']}: {shape['name']}\n"
-            template += f"    '{shape['name']}': {{\n"
-            template += f"        'type': '{shape['type']}',\n"
-            template += f"        'table_title': 'REPLACE_WITH_TABLE_TITLE',\n"
+            entry = {
+                "type": shape["type"],
+                "table_title": "REPLACE_WITH_TABLE_TITLE",
+                "exclude_rows": "base, mean, average, avg",
+                "auto_update": "yes"
+            }
             if shape["type"] == "chart":
-                template += f"        'column': 'Total',  # or specific column name\n"
-            template += f"        'exclude_rows': 'base, mean, average, avg',\n"
-            template += f"        'auto_update': 'yes'\n"
-            template += f"    }},\n\n"
-    
-    template += "}\n"
-    
-    return template
+                entry["column"] = "Total"
+            mappings[shape["name"]] = entry
+
+    template_obj = {"_instructions": [
+        "Edit the mapping values below.",
+        "Save this file.",
+        "Use the apply command to update your PowerPoint."
+    ]}
+    if available_tables:
+        template_obj["_available_tables"] = available_tables
+    template_obj["mappings"] = mappings
+
+    return json.dumps(template_obj, indent=4)
 
 def apply_mapping_from_file(pptx_path: str, mapping_file_path: str, output_path: str = None) -> str:
-    """Apply mappings from a Python file to a PowerPoint presentation."""
+    """Apply mappings from a JSON file to a PowerPoint presentation."""
     if output_path is None:
         output_path = pptx_path.replace(".pptx", "_mapped.pptx")
     
-    # Load the mapping file
     with open(mapping_file_path, 'r') as f:
-        exec(f.read(), globals())
+        data = json.load(f)
     
-    if 'MAPPINGS' not in globals():
-        raise ValueError("No MAPPINGS dictionary found in the file")
+    mappings = data.get("mappings") or data.get("MAPPINGS")
+    if not mappings:
+        raise ValueError("No 'mappings' key found in the JSON file")
     
-    # Apply mappings to PowerPoint
     prs = Presentation(pptx_path)
     
     for slide in prs.slides:
         for shape in slide.shapes:
-            if shape.name and shape.name in MAPPINGS:
-                mapping = MAPPINGS[shape.name]
+            if shape.name and shape.name in mappings:
+                mapping = mappings[shape.name]
                 
-                # Update alt text
                 alt_lines = []
                 for key, value in mapping.items():
                     if value is not None and value != "":
@@ -165,8 +169,8 @@ def apply_mapping_from_file(pptx_path: str, mapping_file_path: str, output_path:
                 if alt_lines:
                     try:
                         shape.alternative_text = "\n".join(alt_lines)
-                    except Exception as e:
-                        print(f"Warning: Could not set alt text for {shape.name}: {e}")
+                    except (AttributeError, ValueError) as e:
+                        logger.warning("Could not set alt text for %s: %s", shape.name, e)
     
     prs.save(output_path)
     return output_path
@@ -256,7 +260,7 @@ def main():
         crosstab_path = sys.argv[3] if len(sys.argv) >= 4 else None
         
         template = generate_mapping_template(pptx_path, crosstab_path)
-        output_file = "mapping_template.py"
+        output_file = "mapping_template.json"
         
         with open(output_file, 'w') as f:
             f.write(template)
@@ -272,7 +276,7 @@ def main():
             output_path = apply_mapping_from_file(pptx_path, mapping_file)
             print(f"Mappings applied successfully! Updated file saved as: {output_path}")
         except Exception as e:
-            print(f"Error applying mappings: {e}")
+            logger.error("Error applying mappings: %s", e)
     
     elif command == "validate" and len(sys.argv) >= 4:
         pptx_path = sys.argv[2]
@@ -292,7 +296,7 @@ def main():
                 for issue in results['issues']:
                     print(f"  - {issue}")
         except Exception as e:
-            print(f"Error validating mappings: {e}")
+            logger.error("Error validating mappings: %s", e)
     
     else:
         print("Invalid command or missing arguments. Use 'python mapping_helper.py' for help.")

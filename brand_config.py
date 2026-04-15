@@ -243,6 +243,38 @@ AI_INSIGHT = {
 
 
 # ---------------------------------------------------------------------------
+# AI Insight Generation Settings
+# Controls the LLM calls in ai_insights.py.  Environment variable AI_MODEL
+# takes precedence over the "model" value below.
+# ---------------------------------------------------------------------------
+
+AI_GENERATION = {
+    "model":          "gpt-4o-mini",
+    "max_tokens":     250,
+    "temperature":    None,               # None → use API default
+    "max_concurrent": 5,
+    "cache_dir":      ".ai_cache",
+    "system_prompt": (
+        "You are a senior research analyst at a creative insights firm specializing in "
+        "travel, tourism, and hospitality. You write with the confident, clear voice of "
+        "an experienced analyst — professional yet conversational. "
+        "Ground every statement in specific data: percentages, averages, and segment "
+        "differences. Interpret the numbers — explain what they mean and why they matter "
+        "for destination marketers and tourism stakeholders. "
+        "Write in present tense. Use active language. "
+        "Never use filler phrases like 'the data shows', 'it is clear that', or "
+        "'interestingly'. Never mention that you are an AI. "
+        "Avoid jargon. Highlight differences by segment where meaningful."
+    ),
+    "system_prompt_wave": (
+        " When previous-wave data is provided, explicitly compare old and new values. "
+        "Highlight meaningful shifts (e.g. 'increased from 28% to 34%') and interpret "
+        "what the change signals for strategy."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Convenience: flat BRAND dict for drop-in replacement in pptx_exporter.py
 # Replace the hardcoded BRAND dict at the top of pptx_exporter.py with:
 #   from brand_config import BRAND
