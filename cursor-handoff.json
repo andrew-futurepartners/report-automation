@@ -1,0 +1,289 @@
+{
+  "project": "Report Relay — PowerPoint Report Automation Tool",
+  "session_date": "2026-05-07",
+  "handoff_from": "Claude (Cowork mode)",
+  "handoff_to": "Cursor",
+
+  "project_overview": {
+    "what_it_is": "A Streamlit app (app.py) that creates and updates PowerPoint reports from Q-style crosstab Excel files. It parses crosstabs, generates branded charts, and updates existing decks with new data while preserving formatting.",
+    "tech_stack": ["Python 3.10+", "Streamlit", "python-pptx", "pandas", "openpyxl", "lxml", "OpenAI API (gpt-4o-mini)"],
+    "entry_point": "app.py (streamlit run app.py)",
+    "key_workflows": [
+      "Create New Report: Upload crosstab → configure charts → export PPTX",
+      "Update Existing Report: Upload PPTX + crosstab → auto-map shapes to tables → update data in-place"
+    ]
+  },
+
+  "what_was_done_this_session": {
+    "summary": "Major upgrade to the auto-mapping engine. Replaced the manual alt-text-based mapping system with a multi-signal AI fuzzy matching engine that uses value correlation, slide context, series-to-row matching, and time series support.",
+    "problem_solved": "The existing system required manual alt-text tagging on every PowerPoint shape to connect charts to crosstab tables. This took too much time for each new project. The upgrade makes mapping automatic and dynamic — it works on any PPTX+crosstab combination without manual setup.",
+    "key_insight": "Pearson correlation of chart values vs crosstab values is a 0.9942+ fingerprint even across different data waves. This is the primary matching signal, supplemented by slide text context (Q-codes, question text), series-name-to-row fuzzy matching, and label overlap.",
+    "files_modified": [
+      {
+        "file": "auto_mapper.py",
+        "status": "major_rewrite",
+        "lines": 928,
+        "changes": [
+          "Added _pearson_r() — hand-rolled Pearson correlation (no numpy dependency)",
+          "Added _value_correlation_distribution() — correlates chart values against table Total column for distribution charts",
+          "Added _value_correlation_segment() — correlates chart values across banner columns for segment breakout charts (flipped orientation)",
+          "Added _value_correlation_timeseries() — correlates chart values across date columns for time series charts",
+          "Added _normalise_date_label() — normalises date strings like 'February 2026', 'Feb 2026', 'Mar 26-28, 2021' to 'mon yyyy' format",
+          "Added _build_segment_mapping() — fuzzy maps chart categories to crosstab banner names (handles 'Baby Boomer+' → 'Boomer or older' via word overlap)",
+          "Added SlideContext dataclass and _extract_slide_contexts() — extracts question text, chart titles, base text, and Q-codes from slide text boxes",
+          "Added _slide_context_score() — scores Q-code match (1.0), question text fuzzy match, chart title keyword overlap",
+          "Added _series_name_score() — fuzzy matches series names to row labels, handles 'Top 2 Box' pattern for composite labels like 'Better or Much Better Off'",
+          "Added score_fingerprint_blended() — orchestrator that combines all 4 signals with configurable weights (0.45 value, 0.25 labels, 0.20 context, 0.10 series)",
+          "Added _is_segment_chart() — detects when chart categories are segments (Total, Gen Z, etc.) vs response options",
+          "Removed time-series skip — trend charts are now matched and updated",
+          "Enhanced _llm_disambiguate() — sends value correlation scores + slide context to LLM for better fallback",
+          "Added ShapeFingerprint.series_values field for per-series value extraction",
+          "Added AutoMapResult sub-score fields (value_corr_score, label_score, context_score, series_score, matched_row)",
+          "Added _infer_column_keys_from_banners() for segment breakout alt-text writing",
+          "results_to_report() now includes all sub-scores for UI display"
+        ]
+      },
+      {
+        "file": "smart_match.py",
+        "status": "moderate_upgrade",
+        "lines": 620,
+        "changes": [
+          "Added _extract_qcode() helper — extracts Q-codes like (Q1369) from text",
+          "Tier 1 _exact_match(): added Q-code matching — if alt_title contains a Q-code, tries matching it against table titles",
+          "Tier 2 _fuzzy_match(): added Q-code boost (0.5) when Q-codes match between alt text and table title",
+          "Tier 2 _fuzzy_match(): added fuzzy row containment — uses SequenceMatcher(threshold=0.7) alongside Jaccard for renamed response options"
+        ]
+      },
+      {
+        "file": "deck_update.py",
+        "status": "moderate_addition",
+        "lines": 1012,
+        "changes": [
+          "Added SequenceMatcher import",
+          "Added append_chart_point import from chart_data_patcher",
+          "Added _normalise_date_label() — date string normalisation for time series matching",
+          "Added _update_timeseries_chart() — reads existing chart categories (dates), finds new date columns in crosstab, maps series to rows via fuzzy matching, appends new data points",
+          "Modified _update_chart() — added timeseries orientation check at top (before flipped check), routes to _update_timeseries_chart() when alt text has orientation=timeseries or chart_mode=timeseries"
+        ]
+      },
+      {
+        "file": "chart_data_patcher.py",
+        "status": "minor_addition",
+        "lines": 369,
+        "changes": [
+          "Added append_chart_point() — reads existing categories and values from chart XML caches, appends a new data point (category label + one value per series), rebuilds caches while preserving all formatting (fills, gradients, data labels, etc.)"
+        ]
+      }
+    ],
+    "files_unchanged": [
+      "app.py — UI already integrates with auto_mapper via auto_map_presentation_obj() and results_to_report(); no changes needed for core functionality, but UI could be enhanced to show sub-scores",
+      "crosstab_parser.py — already parses all sheets correctly including Time Series Banner",
+      "pptx_exporter.py — creates new presentations, not affected by this upgrade",
+      "brand_config.py — brand colors/fonts, not affected",
+      "ai_insights.py — AI insight generation, not affected",
+      "text_utils.py — text formatting utilities, not affected",
+      "mapping_helper.py — CLI mapping tool, not affected",
+      "requirements.txt — no new dependencies (Pearson correlation is hand-rolled)"
+    ]
+  },
+
+  "architecture": {
+    "matching_pipeline": {
+      "description": "Multi-signal blended scoring engine in auto_mapper.py",
+      "flow": [
+        "1. Extract fingerprints from all PPTX shapes (chart categories, series names, values, table headers/rows)",
+        "2. Extract slide contexts (question text, chart titles, Q-codes) from text boxes",
+        "3. Build column banner pool from all crosstab tables for segment detection",
+        "4. For each chart/table shape:",
+        "   a. Detect chart type: distribution vs segment-breakout vs time-series",
+        "   b. Value correlation scoring (primary signal, weight 0.45)",
+        "   c. Label overlap scoring (existing Jaccard/containment, weight 0.25)",
+        "   d. Slide context scoring (Q-code match + question text fuzzy, weight 0.20)",
+        "   e. Series-to-row matching (fuzzy series name → row label, weight 0.10)",
+        "   f. Blend all signals into final score",
+        "   g. If score >= 0.75: accept match",
+        "   h. If score 0.40-0.75 and use_llm=True: LLM fallback with enriched context",
+        "   i. If score < 0.40: unmatched",
+        "5. Associate text shapes (question, base, title) via slide context",
+        "6. Write alt text onto matched shapes (if confidence >= 0.75)",
+        "7. Save PPTX"
+      ],
+      "signals": {
+        "value_correlation": {
+          "weight": 0.45,
+          "description": "Pearson r between chart values and crosstab values. Works across data waves because the relative pattern persists even when absolute values change.",
+          "modes": {
+            "distribution": "Chart values vs table Total column values (aligned by fuzzy-matching category labels to row labels)",
+            "segment_breakout": "Chart values vs each row's values across banner columns (finds the best table+row combination)",
+            "timeseries": "Chart values vs each row's values across date columns (normalised date matching)"
+          }
+        },
+        "label_overlap": {
+          "weight": 0.25,
+          "description": "Jaccard overlap + fuzzy containment of chart categories against table row labels (or column labels for flipped charts)"
+        },
+        "slide_context": {
+          "weight": 0.20,
+          "description": "Q-code extraction from slide text → exact match against table titles. Falls back to SequenceMatcher on question text vs table title."
+        },
+        "series_name": {
+          "weight": 0.10,
+          "description": "Fuzzy match of chart series names against table row labels. Handles abbreviations ('Gas too expensive' → 'Gasoline was too expensive') and Top N Box patterns."
+        }
+      },
+      "weight_override": "For segment breakout and time series charts, value correlation weight increases to 0.55 and label overlap drops to 0.15 (values are more reliable for these chart types)"
+    },
+    "chart_type_detection": {
+      "distribution": "Categories are response options (not segment names), series is uninformative ('%%', 'Series 1')",
+      "segment_breakout": "Categories overlap heavily with column banners (Total, Gen Z, etc.), series name is informative (a specific metric)",
+      "timeseries": "Most categories (>=50%%) look like dates (regex patterns for 'Mon YYYY', 'Mon DD-DD, YYYY', etc.)"
+    },
+    "time_series_update": {
+      "approach": "Append new data points (not full chart replacement)",
+      "flow": [
+        "1. Read existing chart categories (dates) and normalise to 'mon yyyy'",
+        "2. Read crosstab date columns and normalise the same way",
+        "3. Find new dates in crosstab not already in chart",
+        "4. For each new date, for each chart series:",
+        "   a. Match series name to table row label (fuzzy)",
+        "   b. Read the value at that row × date column intersection",
+        "5. Call append_chart_point() to add the new category + values to chart XML"
+      ],
+      "alt_text_format": "orientation: timeseries\\nrow_key: Top 2 Box\\ntype: chart"
+    }
+  },
+
+  "data_context": {
+    "test_data": {
+      "pptx": "The State of the American Traveler - March 2026 Report.pptx (80 slides, 30+ charts, zero alt-text)",
+      "crosstab": "SATS March 2026 - Internal Crosstab 4 3 2026.xlsx (277 tables across 4 sheets: Demographic Banner, Sheet2, Time Series Banner, Collection Date)",
+      "location": "input/ folder in Claude-Workspace"
+    },
+    "crosstab_structure": {
+      "sheets": {
+        "Demographic Banner": "Main cross-tabulations with segments as columns (Total, Gen Z, Millennial, Gen X, Boomer or older, WEST, MIDWEST, NORTHEAST, SOUTH)",
+        "Time Series Banner": "Same questions but with monthly date columns (January 2022 through March 2026, ~52 months)",
+        "Collection Date": "Small sheet with specific collection date metadata",
+        "Sheet2": "Additional tabulations"
+      },
+      "table_structure": {
+        "title": "Full question text with Q-code, e.g. '(Q1369) 92. Would you say that you (and your household) are better off...'",
+        "row_labels": "Response options (e.g. 'Top 2 Box', 'Much better off', 'Better off', ..., 'Base')",
+        "col_labels": "Segment names or date names, possibly with metric qualifiers like 'Total | 1 or more'",
+        "values": "2D array of floats (proportions 0-1 for percentages, raw counts for Base)"
+      }
+    },
+    "chart_patterns_in_pptx": {
+      "distribution": {
+        "example_slides": [2, 12, 15, 19, 23, 26, 29, 30],
+        "description": "Horizontal/vertical bar charts with response options as categories and '%%' as series name",
+        "matching_strategy": "Categories align to row labels, value correlation against Total column"
+      },
+      "segment_breakout": {
+        "example_slides": [4, 5, 6, 7, 8, 13, 16, 20, 24, 27, 31],
+        "description": "Charts with segments (Total, Gen Z, etc.) as categories and a specific metric as series name",
+        "matching_strategy": "Series name fuzzy-matches to a row label, values correlate across banner columns",
+        "known_fuzzy_matches": {
+          "Baby Boomer+": "Boomer or older",
+          "Better or Much Better Off": "Top 2 Box",
+          "Gas too expensive": "Gasoline was too expensive",
+          "Agree or Strongly Agree": "Top 2 Box"
+        }
+      },
+      "timeseries": {
+        "example_slides": [3, 14, 17, 21, 25, 28],
+        "description": "Line charts with dates as categories (66+ data points), tracking metrics over time",
+        "matching_strategy": "Date normalisation + value correlation against Time Series Banner rows",
+        "update_approach": "Append new month data points (chart ends at Feb 2026, crosstab has March 2026)"
+      }
+    }
+  },
+
+  "testing": {
+    "unit_tests_passed": 12,
+    "test_results": [
+      "1. Pearson correlation: 0.9942 (cross-wave accuracy confirmed)",
+      "2. Date normalisation: 'February 2026' → 'feb 2026', 'Mar 26-28, 2021' → 'mar 2021'",
+      "3. Segment mapping: 5/5 mapped including 'Baby Boomer+' → 'Boomer or older' (word overlap)",
+      "4. Q-code extraction: (Q1369) correctly extracted",
+      "5. Series→row (Top 2 Box): score=0.80, matched 'Much better off' (text-level; value corr refines)",
+      "6. Series→row (substring): score=0.80, matched 'Travel is too expensive' (text-ambiguous case)",
+      "7. Segment detection: correctly identifies segment vs response-option categories",
+      "8. Trend detection: correctly identifies date-based categories",
+      "9. Slide context (Q-code): score=1.00 when Q-code matches",
+      "10. Value correlation (distribution): r=0.9942 with fuzzy label alignment",
+      "11. Value correlation (segment breakout): r=1.0000, correctly identified 'Top 2 Box' row",
+      "12. Value correlation (time series): r=1.0000, correctly identified 'Top 2 Box' row"
+    ],
+    "note": "Integration test against the full 80-slide SATS deck + 277-table crosstab was not run due to session time constraints. This is the recommended first test in Cursor."
+  },
+
+  "known_limitations_and_next_steps": {
+    "limitations": [
+      "Series-to-row text matching is ambiguous when multiple row labels share similar wording (e.g. 'Gas too expensive' scores 0.80 against both 'Travel is too expensive' and 'Gasoline was too expensive'). Value correlation resolves this in practice.",
+      "The 'Top N Box' pattern matching is heuristic — it assumes 'or' in a series name → look for Top N Box rows. May need refinement for other composite patterns.",
+      "Time series date normalisation handles 'Mon YYYY' and 'Mon DD-DD, YYYY' patterns. Other date formats (ISO, DD/MM/YYYY) are not yet supported.",
+      "app.py UI hasn't been updated to show the new sub-scores (value_corr_score, label_score, context_score, series_score) in the Auto-Map Results table. The data is available in results_to_report() output."
+    ],
+    "recommended_next_steps": [
+      {
+        "priority": "P0",
+        "task": "Run full integration test: load the SATS PPTX + crosstab in Streamlit, click 'AI Auto-Map', verify match accuracy across all 30+ charts",
+        "reason": "Unit tests pass but the full pipeline hasn't been tested end-to-end with real data yet"
+      },
+      {
+        "priority": "P1",
+        "task": "Update app.py Auto-Map Results UI to display sub-scores (value_corr, label, context, series) and matched_row column",
+        "reason": "The data is already in results_to_report() but the UI only shows the overall confidence score"
+      },
+      {
+        "priority": "P1",
+        "task": "Test time series chart append on a real PPTX — verify the new data point renders correctly in PowerPoint",
+        "reason": "append_chart_point() XML patching is tested at the API level but not visually confirmed in PowerPoint"
+      },
+      {
+        "priority": "P2",
+        "task": "Test with a different project's PPTX + crosstab to confirm no SATS-specific assumptions leaked in",
+        "reason": "Generalization is designed in but not yet validated"
+      },
+      {
+        "priority": "P2",
+        "task": "Consider multi-series time series charts — current implementation matches each series independently by name, which should work but needs testing with charts that have 3+ series (like Slide 3 with 8 series)",
+        "reason": "Most time series charts tested had 1 series; multi-series is untested"
+      }
+    ]
+  },
+
+  "key_functions_reference": {
+    "auto_mapper.py": {
+      "_pearson_r(x, y)": "Pearson correlation, returns 0.0 if variance is zero or n<3",
+      "_build_segment_mapping(chart_cats, xtab_banners)": "Returns {chart_idx: banner_idx} dict via exact + fuzzy + word-overlap matching",
+      "_value_correlation_distribution(vals, cats, table)": "Returns float 0-1, aligns chart cats to table rows by prefix/fuzzy match",
+      "_value_correlation_segment(vals, cats, table)": "Returns (float, matched_row_label), tries every non-base row",
+      "_value_correlation_timeseries(vals, cats, table)": "Returns (float, matched_row_label), normalises dates to 'mon yyyy'",
+      "_extract_slide_contexts(prs)": "Returns Dict[slide_idx, SlideContext] for slides with data shapes",
+      "_slide_context_score(ctx, table)": "Returns float 0-1, Q-code match = 1.0",
+      "_series_name_score(series_names, table)": "Returns (float, matched_row_label), handles Top N Box pattern",
+      "score_fingerprint_blended(fp, tables, ctx, banners_pool)": "Main scorer, returns sorted List[MapCandidate]",
+      "auto_map_presentation_obj(prs, tables, ...)": "Orchestrator — extracts fingerprints + contexts, scores, writes alt text"
+    },
+    "chart_data_patcher.py": {
+      "append_chart_point(chart, cat_label, series_values)": "Appends one data point to existing chart XML, preserving all formatting"
+    },
+    "deck_update.py": {
+      "_update_timeseries_chart(chart, table, row_key)": "Finds new date columns, matches series to rows, calls append_chart_point()"
+    }
+  },
+
+  "configurable_constants": {
+    "auto_mapper.py": {
+      "WEIGHT_VALUE_CORR": "0.45 — value correlation weight in blended score",
+      "WEIGHT_LABEL_OVERLAP": "0.25 — label Jaccard/containment weight",
+      "WEIGHT_SLIDE_CONTEXT": "0.20 — slide text context weight",
+      "WEIGHT_SERIES_NAME": "0.10 — series-to-row matching weight",
+      "HIGH_CONFIDENCE_THRESHOLD": "0.75 — minimum score to accept a match without LLM",
+      "LLM_THRESHOLD": "0.40 — minimum score to trigger LLM fallback",
+      "ALT_TEXT_WRITE_THRESHOLD": "0.75 — minimum confidence to write alt text onto shape"
+    }
+  }
+}

@@ -3,12 +3,16 @@ auto_mapper.py — AI-powered bootstrap pass that maps un-annotated PowerPoint
 shapes to crosstab tables by extracting structural fingerprints from existing
 chart/table data and matching them against parsed crosstab tables.
 
+v2: Multi-signal matching engine with value correlation, slide context,
+series-to-row fuzzy matching, and time-series support.
+
 Produces a copy of the PPTX with alt text written onto matched shapes so that
 the normal deck_update pipeline can process it without manual pre-mapping.
 """
 
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -22,6 +26,24 @@ logger = logging.getLogger("report_relay.auto_mapper")
 
 P_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 
+# ---------------------------------------------------------------------------
+# Blended scoring weights (configurable)
+# ---------------------------------------------------------------------------
+
+WEIGHT_VALUE_CORR = 0.45
+WEIGHT_LABEL_OVERLAP = 0.25
+WEIGHT_SLIDE_CONTEXT = 0.20
+WEIGHT_SERIES_NAME = 0.10
+
+# Confidence thresholds
+HIGH_CONFIDENCE_THRESHOLD = 0.75
+LLM_THRESHOLD = 0.40
+ALT_TEXT_WRITE_THRESHOLD = 0.75
+
+
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "")).strip().lower()
@@ -51,9 +73,27 @@ _DATE_PATTERNS = [
         r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*\s+\d{1,2}",
         re.IGNORECASE,
     ),
+    re.compile(
+        r"\d{1,2}[/-]\d{1,2}[/-]\d{2,4}",
+    ),
 ]
 
+# Month name → month number for date normalisation
+_MONTH_MAP = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+    "january": 1, "february": 2, "march": 3, "april": 4, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10,
+    "november": 11, "december": 12,
+}
+
 _UNINFORMATIVE_SERIES = frozenset({"%", "series 1", "series1", ""})
+
+_SEGMENT_KEYWORDS = frozenset({
+    "total", "gen z", "millennial", "gen x", "boomer", "baby boomer",
+    "west", "midwest", "northeast", "south", "male", "female",
+    "18-24", "25-34", "35-44", "45-54", "55-64", "65+",
+})
 
 
 def _extract_qcode(text: str) -> Optional[str]:
@@ -63,7 +103,6 @@ def _extract_qcode(text: str) -> Optional[str]:
 
 
 def _is_uninformative_series(names: List[str]) -> bool:
-    """True when every series name is a generic placeholder."""
     if not names:
         return True
     return all(_norm(n) in _UNINFORMATIVE_SERIES for n in names)
@@ -80,22 +119,71 @@ def _is_trend_chart(categories: List[str]) -> bool:
     return hits / len(categories) >= 0.5
 
 
+def _is_segment_chart(categories: List[str], col_banners_pool: set) -> bool:
+    """True when chart categories are demographic/segment columns, not response options.
+
+    Uses a two-pronged check:
+    1. High overlap with actual column banners from the crosstab
+    2. Fallback to common segment keywords
+    """
+    if not categories:
+        return False
+    norm_cats = {_norm(c) for c in categories}
+    # Check against actual crosstab column banners
+    if col_banners_pool:
+        overlap = len(norm_cats & col_banners_pool)
+        if overlap / len(norm_cats) >= 0.5:
+            return True
+    # Fallback: keyword check
+    keyword_hits = sum(1 for c in norm_cats if any(kw in c for kw in _SEGMENT_KEYWORDS))
+    return keyword_hits / len(norm_cats) >= 0.5
+
+
+# ---------------------------------------------------------------------------
+# Value correlation helpers
+# ---------------------------------------------------------------------------
+
+def _pearson_r(x: List[float], y: List[float]) -> float:
+    """Compute Pearson correlation coefficient between two equal-length vectors.
+
+    Returns 0.0 if either vector has zero variance or lengths differ.
+    """
+    n = min(len(x), len(y))
+    if n < 3:
+        return 0.0
+
+    x, y = x[:n], y[:n]
+    mx = sum(x) / n
+    my = sum(y) / n
+
+    sx = sum((xi - mx) ** 2 for xi in x)
+    sy = sum((yi - my) ** 2 for yi in y)
+
+    if sx == 0 or sy == 0:
+        return 0.0
+
+    sxy = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+    return sxy / (sx * sy) ** 0.5
+
+
 def _fuzzy_match_label(
     label: str,
     candidates: List[str],
     threshold: float = 0.6,
 ) -> Optional[str]:
-    """Find the best fuzzy match for *label* among *candidates*.
-
-    Returns the best matching candidate string or None.
-    """
+    """Find the best fuzzy match for *label* among *candidates*."""
     if not label or not candidates:
         return None
     norm_label = _norm(label)
     best_score = 0.0
     best_match: Optional[str] = None
     for cand in candidates:
-        ratio = SequenceMatcher(None, norm_label, _norm(cand)).ratio()
+        norm_cand = _norm(cand)
+        # Exact substring match gets a boost
+        if norm_label in norm_cand or norm_cand in norm_label:
+            ratio = max(0.85, SequenceMatcher(None, norm_label, norm_cand).ratio())
+        else:
+            ratio = SequenceMatcher(None, norm_label, norm_cand).ratio()
         if ratio > best_score:
             best_score = ratio
             best_match = cand
@@ -104,20 +192,513 @@ def _fuzzy_match_label(
     return None
 
 
-def _fuzzy_containment(subset_labels: set, superset_labels: set, threshold: float = 0.7) -> float:
-    """Like _containment but with fuzzy matching for individual labels."""
-    if not subset_labels:
-        return 0.0
-    hits = 0
-    for label in subset_labels:
-        if label in superset_labels:
-            hits += 1
-            continue
-        for cand in superset_labels:
-            if SequenceMatcher(None, label, cand).ratio() >= threshold:
-                hits += 1
+def _build_segment_mapping(
+    chart_categories: List[str],
+    crosstab_banners: List[str],
+    threshold: float = 0.55,
+) -> Dict[int, int]:
+    """Map chart category indices to crosstab banner indices via fuzzy matching.
+
+    Returns {chart_idx: banner_idx} for matched pairs.
+    """
+    mapping: Dict[int, int] = {}
+    used_banner_idxs: set = set()
+
+    # First pass: exact (normalised) matches
+    norm_banners = [_norm(b) for b in crosstab_banners]
+    for ci, cat in enumerate(chart_categories):
+        nc = _norm(cat)
+        for bi, nb in enumerate(norm_banners):
+            if bi in used_banner_idxs:
+                continue
+            if nc == nb:
+                mapping[ci] = bi
+                used_banner_idxs.add(bi)
                 break
-    return hits / len(subset_labels)
+
+    # Second pass: fuzzy matches for unmatched categories
+    _stop_words = {"the", "a", "an", "of", "in", "for", "and", "or", "to", "is", "it"}
+    for ci, cat in enumerate(chart_categories):
+        if ci in mapping:
+            continue
+        nc = _norm(cat).rstrip("+").strip()
+        nc_words = set(nc.split()) - _stop_words
+        best_score = 0.0
+        best_bi = None
+        for bi, nb in enumerate(norm_banners):
+            if bi in used_banner_idxs:
+                continue
+            nb_clean = nb.rstrip("+").strip()
+            nb_words = set(nb_clean.split()) - _stop_words
+            # Substring containment
+            if nc in nb_clean or nb_clean in nc:
+                score = max(0.85, SequenceMatcher(None, nc, nb_clean).ratio())
+            # Word overlap: if a significant keyword is shared (e.g., "boomer")
+            elif nc_words and nb_words and len(nc_words & nb_words) / max(len(nc_words), len(nb_words)) >= 0.3:
+                score = max(0.70, SequenceMatcher(None, nc, nb_clean).ratio())
+            else:
+                score = SequenceMatcher(None, nc, nb_clean).ratio()
+            if score > best_score:
+                best_score = score
+                best_bi = bi
+        if best_bi is not None and best_score >= threshold:
+            mapping[ci] = best_bi
+            used_banner_idxs.add(best_bi)
+
+    return mapping
+
+
+def _value_correlation_distribution(
+    fp_values: List[float],
+    fp_categories: List[str],
+    table: Dict[str, Any],
+) -> float:
+    """Correlate chart values against a table's Total column (distribution chart).
+
+    Aligns chart categories to table row labels by fuzzy matching, then
+    computes Pearson r on the aligned value pairs.
+    """
+    row_labels = table.get("row_labels", [])
+    col_labels = table.get("col_labels", [])
+    values = table.get("values", [])
+
+    if not row_labels or not values:
+        return 0.0
+
+    # Find Total column
+    total_idx = None
+    for preferred in ["Total", "Overall", "All"]:
+        if preferred in col_labels:
+            total_idx = col_labels.index(preferred)
+            break
+    if total_idx is None:
+        total_idx = 0 if col_labels else None
+    if total_idx is None:
+        return 0.0
+
+    # Align chart categories to table row labels
+    chart_vals_aligned: List[float] = []
+    table_vals_aligned: List[float] = []
+
+    norm_rows = {_norm(rl): i for i, rl in enumerate(row_labels)}
+
+    used_row_indices: set = set()
+    for ci, cat in enumerate(fp_categories):
+        if ci >= len(fp_values) or fp_values[ci] is None:
+            continue
+        nc = _norm(cat)
+        # Try exact match first
+        ri = norm_rows.get(nc)
+        # Try prefix/startswith match (handles "UNCHANGED - Neither..." → "UNCHANGED")
+        if ri is None:
+            for nrl, idx in norm_rows.items():
+                if idx in used_row_indices:
+                    continue
+                if nc.startswith(nrl) or nrl.startswith(nc):
+                    ri = idx
+                    break
+        # Fall back to fuzzy only if no prefix match
+        if ri is None:
+            best_ratio = 0.0
+            best_ri = None
+            for nrl, idx in norm_rows.items():
+                if idx in used_row_indices:
+                    continue
+                ratio = SequenceMatcher(None, nc, nrl).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_ri = idx
+            if best_ratio >= 0.65:
+                ri = best_ri
+        if ri is not None and ri not in used_row_indices and ri < len(values) and total_idx < len(values[ri]):
+            used_row_indices.add(ri)
+            tv = values[ri][total_idx]
+            if tv is not None:
+                try:
+                    chart_vals_aligned.append(float(fp_values[ci]))
+                    table_vals_aligned.append(float(tv))
+                except (ValueError, TypeError):
+                    pass
+
+    if len(chart_vals_aligned) < 3:
+        return 0.0
+
+    r = _pearson_r(chart_vals_aligned, table_vals_aligned)
+    return max(0.0, r)
+
+
+def _value_correlation_segment(
+    fp_values: List[float],
+    fp_categories: List[str],
+    table: Dict[str, Any],
+) -> Tuple[float, Optional[str]]:
+    """Correlate chart values against each row's values across segment columns.
+
+    For segment breakout charts where categories are segments (Total, Gen Z, etc.)
+    and the chart shows one metric (row) across those segments.
+
+    Returns (best_correlation, matched_row_label).
+    """
+    row_labels = table.get("row_labels", [])
+    col_labels = table.get("col_labels", [])
+    banners = table.get("meta", {}).get("col_banners", col_labels)
+    values = table.get("values", [])
+
+    if not row_labels or not values or not banners:
+        return 0.0, None
+
+    # Build chart-category → banner-index mapping
+    seg_map = _build_segment_mapping(fp_categories, banners)
+    if len(seg_map) < 3:
+        return 0.0, None
+
+    best_r = 0.0
+    best_row = None
+
+    for ri, rl in enumerate(row_labels):
+        # Skip base/mean rows
+        nrl = _norm(rl)
+        if nrl.startswith(("base", "mean", "average", "avg", "median")):
+            continue
+        if ri >= len(values):
+            continue
+
+        chart_aligned: List[float] = []
+        table_aligned: List[float] = []
+
+        for ci, bi in sorted(seg_map.items()):
+            if ci >= len(fp_values) or fp_values[ci] is None:
+                continue
+            if bi >= len(values[ri]):
+                continue
+            tv = values[ri][bi]
+            if tv is not None:
+                try:
+                    chart_aligned.append(float(fp_values[ci]))
+                    table_aligned.append(float(tv))
+                except (ValueError, TypeError):
+                    pass
+
+        if len(chart_aligned) < 3:
+            continue
+
+        r = _pearson_r(chart_aligned, table_aligned)
+        if r > best_r:
+            best_r = r
+            best_row = rl
+
+    return max(0.0, best_r), best_row
+
+
+def _value_correlation_timeseries(
+    fp_values: List[float],
+    fp_categories: List[str],
+    table: Dict[str, Any],
+) -> Tuple[float, Optional[str]]:
+    """Correlate a time-series chart's values against time-series table rows.
+
+    Time-series charts have date categories and the crosstab time-series tables
+    have date column headers (e.g., "January 2022", "February 2022", ...).
+
+    Returns (best_correlation, matched_row_label).
+    """
+    row_labels = table.get("row_labels", [])
+    col_labels = table.get("col_labels", [])
+    values = table.get("values", [])
+
+    if not row_labels or not values or not col_labels:
+        return 0.0, None
+
+    # Normalise chart date categories to "mon yyyy" format
+    chart_date_keys = [_normalise_date_label(c) for c in fp_categories]
+    # Normalise crosstab column labels to the same format
+    col_date_keys = [_normalise_date_label(c) for c in col_labels]
+
+    # Build col_date_key → col_idx mapping
+    col_key_to_idx: Dict[str, int] = {}
+    for ci, dk in enumerate(col_date_keys):
+        if dk and dk not in col_key_to_idx:
+            col_key_to_idx[dk] = ci
+
+    best_r = 0.0
+    best_row = None
+
+    for ri, rl in enumerate(row_labels):
+        nrl = _norm(rl)
+        if nrl.startswith(("base", "mean", "average", "avg", "median")):
+            continue
+        if ri >= len(values):
+            continue
+
+        chart_aligned: List[float] = []
+        table_aligned: List[float] = []
+
+        for ci, dk in enumerate(chart_date_keys):
+            if not dk or ci >= len(fp_values) or fp_values[ci] is None:
+                continue
+            col_idx = col_key_to_idx.get(dk)
+            if col_idx is None:
+                continue
+            if col_idx >= len(values[ri]):
+                continue
+            tv = values[ri][col_idx]
+            if tv is not None:
+                try:
+                    chart_aligned.append(float(fp_values[ci]))
+                    table_aligned.append(float(tv))
+                except (ValueError, TypeError):
+                    pass
+
+        if len(chart_aligned) < 3:
+            continue
+
+        r = _pearson_r(chart_aligned, table_aligned)
+        if r > best_r:
+            best_r = r
+            best_row = rl
+
+    return max(0.0, best_r), best_row
+
+
+def _normalise_date_label(label: str) -> Optional[str]:
+    """Normalise a date string to 'mon yyyy' for comparison.
+
+    Handles: 'Feb 2026', 'February 2026', 'Feb 17-Mar 3, 2026',
+             'Mar 26-28, 2021', 'Oct 2025', etc.
+    Returns e.g. 'feb 2026' or None if not parseable.
+    """
+    if not label:
+        return None
+    s = label.strip().lower()
+
+    # Try "Month YYYY" or "Mon YYYY" pattern
+    m = re.match(r"(\w+)\s+(\d{4})", s)
+    if m:
+        month_str = m.group(1)
+        year = m.group(2)
+        if month_str in _MONTH_MAP:
+            return f"{month_str[:3]} {year}"
+
+    # Try "Mon DD-DD, YYYY" or "Mon DD, YYYY" pattern (exact collection dates)
+    m = re.match(r"(\w+)\s+\d{1,2}(?:[,-]\s*(?:\w+\s+)?\d{1,2})?,?\s*(\d{4})", s)
+    if m:
+        month_str = m.group(1)
+        year = m.group(2)
+        if month_str in _MONTH_MAP:
+            return f"{month_str[:3]} {year}"
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Slide context
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SlideContext:
+    """Text context extracted from a slide's text boxes."""
+    slide_idx: int
+    question_text: str = ""
+    chart_title: str = ""
+    base_text: str = ""
+    q_code: Optional[str] = None
+    all_text: str = ""  # concatenation of all text on the slide
+
+
+def _extract_slide_contexts(prs: Presentation) -> Dict[int, SlideContext]:
+    """Extract text context from every slide that has a chart or table."""
+    contexts: Dict[int, SlideContext] = {}
+
+    for slide_idx, slide in enumerate(prs.slides):
+        # Check if slide has chart or table
+        has_data_shape = False
+        for shp in slide.shapes:
+            try:
+                _ = shp.chart
+                has_data_shape = True
+            except (ValueError, AttributeError):
+                pass
+            if shp.has_table:
+                has_data_shape = True
+
+        if not has_data_shape:
+            continue
+
+        ctx = SlideContext(slide_idx=slide_idx)
+        all_texts: List[str] = []
+
+        for shp in slide.shapes:
+            # Skip data shapes
+            is_data = False
+            try:
+                _ = shp.chart
+                is_data = True
+            except (ValueError, AttributeError):
+                pass
+            if shp.has_table:
+                is_data = True
+            if is_data:
+                continue
+
+            if not hasattr(shp, "text_frame"):
+                continue
+            text = shp.text_frame.text.strip()
+            if not text or len(text) < 3:
+                continue
+
+            all_texts.append(text)
+            lower = text.lower()
+
+            # Classify text
+            if lower.startswith("question:") or lower.startswith("q:"):
+                ctx.question_text = text
+            elif lower.startswith("base:") or ("respondent" in lower and ("base" in lower or "n=" in lower)):
+                ctx.base_text = text
+            elif not ctx.chart_title and len(text) < 120:
+                # Short text that isn't question/base is likely the chart title
+                # Skip if it looks like a callout (contains %)
+                if not re.search(r"\d+\.?\d*%", text):
+                    ctx.chart_title = text
+
+            # Extract Q-code from any text
+            qc = _extract_qcode(text)
+            if qc:
+                ctx.q_code = qc
+
+        ctx.all_text = " ".join(all_texts)
+        contexts[slide_idx] = ctx
+
+    return contexts
+
+
+def _slide_context_score(
+    ctx: Optional[SlideContext],
+    table: Dict[str, Any],
+) -> float:
+    """Score how well a slide's text context matches a crosstab table.
+
+    Returns 0.0–1.0.
+    """
+    if ctx is None:
+        return 0.0
+
+    table_title = table.get("title", "")
+
+    # Q-code exact match is the strongest signal
+    if ctx.q_code and ctx.q_code in table_title:
+        return 1.0
+
+    # Also check if the table title contains a Q-code that appears in slide text
+    table_qcode = _extract_qcode(table_title)
+    if table_qcode and ctx.all_text and table_qcode in ctx.all_text:
+        return 0.95
+
+    # Fuzzy match question text against table title
+    best_score = 0.0
+
+    if ctx.question_text:
+        # Strip "Question: " prefix for cleaner matching
+        q = ctx.question_text
+        if q.lower().startswith("question:"):
+            q = q[9:].strip()
+        # The table title often has the Q-code + full question text
+        # Extract just the question part from the table title for comparison
+        table_q = re.sub(r"\(Q\d+[_\d]*\)\s*\d*\.\s*", "", table_title).strip()
+        # Remove trailing "by Demographic Banner" etc
+        table_q = re.sub(r"\s+by\s+\w+\s+Banner.*$", "", table_q, flags=re.IGNORECASE).strip()
+
+        ratio = SequenceMatcher(None, _norm(q)[:200], _norm(table_q)[:200]).ratio()
+        best_score = max(best_score, ratio)
+
+    if ctx.chart_title:
+        # Chart titles are often short descriptive names like "Travel as a Budget Priority"
+        # Check if keywords from the chart title appear in the table's row labels
+        title_words = set(_norm(ctx.chart_title).split()) - {"by", "the", "a", "an", "of", "in", "for", "and", "or", "to", "is", "it"}
+        row_text = " ".join(_norm(rl) for rl in table.get("row_labels", []))
+        if title_words:
+            word_hits = sum(1 for w in title_words if w in row_text or w in _norm(table_title))
+            word_score = min(1.0, word_hits / max(3, len(title_words)))
+            best_score = max(best_score, word_score * 0.7)
+
+    return best_score
+
+
+# ---------------------------------------------------------------------------
+# Series-to-row matching
+# ---------------------------------------------------------------------------
+
+def _series_name_score(
+    series_names: List[str],
+    table: Dict[str, Any],
+) -> Tuple[float, Optional[str]]:
+    """Score how well chart series names match table row labels.
+
+    Returns (score, matched_row_label).
+    """
+    if _is_uninformative_series(series_names):
+        return 0.0, None
+
+    row_labels = table.get("row_labels", [])
+    if not row_labels:
+        return 0.0, None
+
+    best_score = 0.0
+    best_row = None
+
+    for sname in series_names:
+        ns = _norm(sname)
+        if not ns or ns in _UNINFORMATIVE_SERIES:
+            continue
+
+        # Try exact/substring match against row labels
+        for rl in row_labels:
+            nrl = _norm(rl)
+            if nrl.startswith(("base", "mean", "average", "avg")):
+                continue
+
+            # Exact match
+            if ns == nrl:
+                return 1.0, rl
+
+            # Substring containment (either direction)
+            if ns in nrl or nrl in ns:
+                score = max(0.80, SequenceMatcher(None, ns, nrl).ratio())
+                if score > best_score:
+                    best_score = score
+                    best_row = rl
+                continue
+
+            # Fuzzy match
+            ratio = SequenceMatcher(None, ns, nrl).ratio()
+            if ratio > best_score and ratio >= 0.55:
+                best_score = ratio
+                best_row = rl
+
+        # Check for "Top N Box" pattern:
+        # Series name like "Better or Much Better Off" maps to "Top 2 Box"
+        if " or " in ns or " and " in ns:
+            for rl in row_labels:
+                nrl = _norm(rl)
+                if nrl.startswith("top") and "box" in nrl:
+                    # This is likely the aggregate row
+                    score = 0.70  # Good confidence for Top N Box match
+                    if score > best_score:
+                        best_score = score
+                        best_row = rl
+
+        # Also try matching series name against keywords in the table title
+        table_title = _norm(table.get("title", ""))
+        if ns and table_title:
+            # If series name words appear in the table title, that's a weak but useful signal
+            s_words = set(ns.split()) - {"the", "a", "an", "of", "in", "for", "and", "or", "to"}
+            title_words = set(table_title.split())
+            if s_words and len(s_words & title_words) / len(s_words) >= 0.3:
+                score = 0.40
+                if score > best_score:
+                    best_score = score
+                    # Don't set best_row here — the series name didn't match a specific row
+
+    return best_score, best_row
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +719,8 @@ class ShapeFingerprint:
     text_content: str = ""
     values_sample: List[float] = field(default_factory=list)
     existing_alt: str = ""
+    # Full value data per series (for multi-series correlation)
+    series_values: List[List[float]] = field(default_factory=list)
 
 
 def _extract_chart_fingerprint(shape, slide_idx: int, shape_idx: int) -> Optional[ShapeFingerprint]:
@@ -157,18 +740,23 @@ def _extract_chart_fingerprint(shape, slide_idx: int, shape_idx: int) -> Optiona
 
     series_names = []
     values_sample = []
+    series_values = []
     try:
         for s in chart.series:
             try:
                 series_names.append(str(s.name) if s.name else "")
             except Exception:
                 series_names.append("")
+            s_vals = []
             try:
                 for v in s.values:
-                    if v is not None:
-                        values_sample.append(float(v))
+                    fv = float(v) if v is not None else None
+                    if fv is not None:
+                        values_sample.append(fv)
+                    s_vals.append(fv)
             except Exception:
                 pass
+            series_values.append(s_vals)
     except Exception:
         pass
 
@@ -182,7 +770,8 @@ def _extract_chart_fingerprint(shape, slide_idx: int, shape_idx: int) -> Optiona
         shape_type="chart",
         categories=categories,
         series_names=series_names,
-        values_sample=values_sample[:20],
+        values_sample=values_sample[:50],
+        series_values=series_values,
         existing_alt=_read_existing_alt(shape),
     )
 
@@ -253,36 +842,35 @@ def extract_all_fingerprints(prs: Presentation) -> List[ShapeFingerprint]:
 
 
 # ---------------------------------------------------------------------------
-# Structural scoring
+# Label overlap scoring (preserved from v1)
 # ---------------------------------------------------------------------------
 
-ROW_WEIGHT = 0.65
-COL_WEIGHT = 0.35
-
-
-@dataclass
-class MapCandidate:
-    """A candidate table match for a fingerprint."""
-    table: Dict[str, Any]
-    score: float
-    row_score: float = 0.0
-    col_score: float = 0.0
-    orientation: str = "normal"            # "normal" | "flipped"
+_LABEL_ROW_WEIGHT = 0.65
+_LABEL_COL_WEIGHT = 0.35
 
 
 def _containment(subset: set, superset: set) -> float:
-    """What fraction of *subset* appears in *superset*?
-
-    Charts typically show a subset of table rows (excluding Base/Mean) and
-    only one of many columns, so containment is a better measure than Jaccard.
-    """
     if not subset:
         return 0.0
     return len(subset & superset) / len(subset)
 
 
+def _fuzzy_containment(subset_labels: set, superset_labels: set, threshold: float = 0.7) -> float:
+    if not subset_labels:
+        return 0.0
+    hits = 0
+    for label in subset_labels:
+        if label in superset_labels:
+            hits += 1
+            continue
+        for cand in superset_labels:
+            if SequenceMatcher(None, label, cand).ratio() >= threshold:
+                hits += 1
+                break
+    return hits / len(subset_labels)
+
+
 def _sim_blend(fp_set: set, t_set: set, use_fuzzy: bool = False) -> float:
-    """Containment/Jaccard blend; optionally fuzzy for abbreviated labels."""
     if use_fuzzy:
         contain = _fuzzy_containment(fp_set, t_set, threshold=0.7)
     else:
@@ -291,38 +879,43 @@ def _sim_blend(fp_set: set, t_set: set, use_fuzzy: bool = False) -> float:
     return 0.6 * contain + 0.4 * jacc
 
 
-def score_fingerprint_against_tables(
-    fp: ShapeFingerprint,
-    tables: List[Dict[str, Any]],
-) -> List[MapCandidate]:
-    """Score a single fingerprint against all tables using label overlap.
+@dataclass
+class MapCandidate:
+    """A candidate table match for a fingerprint."""
+    table: Dict[str, Any]
+    score: float
+    # Sub-scores for debugging/UI
+    value_corr_score: float = 0.0
+    label_score: float = 0.0
+    context_score: float = 0.0
+    series_score: float = 0.0
+    row_score: float = 0.0
+    col_score: float = 0.0
+    orientation: str = "normal"
+    matched_row: Optional[str] = None
 
-    Tries both axis orientations for charts (normal and flipped) and keeps
-    the higher score.  When series names are uninformative (``%``,
-    ``Series 1``), the column axis is ignored so the score is based
-    entirely on row/category similarity.
+
+def _label_overlap_score(
+    fp: ShapeFingerprint,
+    table: Dict[str, Any],
+) -> Tuple[float, float, str]:
+    """Compute label overlap score between a fingerprint and a table.
+
+    Returns (row_score, col_score, orientation).
     """
+    t_rows = {_norm(r) for r in table.get("row_labels", []) if isinstance(r, str)}
+    t_cols = {_norm(c) for c in table.get("col_labels", []) if isinstance(c, str)}
+
     if fp.shape_type == "chart":
         fp_cats = {_norm(c) for c in fp.categories if c}
         fp_ser = {_norm(s) for s in fp.series_names if s}
         uninformative = _is_uninformative_series(fp.series_names)
-    elif fp.shape_type == "table":
-        fp_cats = {_norm(r) for r in fp.row_labels if r}
-        fp_ser = {_norm(c) for c in fp.col_headers if c}
-        uninformative = False
-    else:
-        return []
 
-    candidates: List[MapCandidate] = []
-    for t in tables:
-        t_rows = {_norm(r) for r in t.get("row_labels", []) if isinstance(r, str)}
-        t_cols = {_norm(c) for c in t.get("col_labels", []) if isinstance(c, str)}
-
-        # --- Normal orientation: categories↔rows, series↔cols ---
+        # Normal orientation
         row_sim_n = _sim_blend(fp_cats, t_rows)
         col_sim_n = _sim_blend(fp_ser, t_cols) if not uninformative else 0.0
-        rw = 1.0 if uninformative else ROW_WEIGHT
-        cw = 0.0 if uninformative else COL_WEIGHT
+        rw = 1.0 if uninformative else _LABEL_ROW_WEIGHT
+        cw = 0.0 if uninformative else _LABEL_COL_WEIGHT
         score_n = rw * row_sim_n + cw * col_sim_n
 
         best_score = score_n
@@ -330,40 +923,171 @@ def score_fingerprint_against_tables(
         best_col = col_sim_n
         best_orient = "normal"
 
-        # --- Flipped orientation: categories↔cols, series↔rows ---
-        if fp.shape_type == "chart" and not uninformative:
+        # Flipped orientation
+        if not uninformative:
             row_sim_f = _sim_blend(fp_cats, t_cols)
             col_sim_f = _sim_blend(fp_ser, t_rows, use_fuzzy=True)
-            score_f = ROW_WEIGHT * row_sim_f + COL_WEIGHT * col_sim_f
+            score_f = _LABEL_ROW_WEIGHT * row_sim_f + _LABEL_COL_WEIGHT * col_sim_f
             if score_f > best_score:
-                best_score = score_f
                 best_row = row_sim_f
                 best_col = col_sim_f
                 best_orient = "flipped"
 
+        return best_row, best_col, best_orient
+
+    elif fp.shape_type == "table":
+        fp_rows = {_norm(r) for r in fp.row_labels if r}
+        fp_cols = {_norm(c) for c in fp.col_headers if c}
+        row_sim = _sim_blend(fp_rows, t_rows)
+        col_sim = _sim_blend(fp_cols, t_cols)
+        return row_sim, col_sim, "normal"
+
+    return 0.0, 0.0, "normal"
+
+
+# ---------------------------------------------------------------------------
+# Blended scoring
+# ---------------------------------------------------------------------------
+
+def score_fingerprint_blended(
+    fp: ShapeFingerprint,
+    tables: List[Dict[str, Any]],
+    slide_ctx: Optional[SlideContext] = None,
+    col_banners_pool: Optional[set] = None,
+) -> List[MapCandidate]:
+    """Score a fingerprint against all tables using all available signals.
+
+    Returns candidates sorted by final blended score (descending).
+    """
+    if fp.shape_type not in ("chart", "table"):
+        return []
+
+    # Determine chart orientation type
+    is_trend = fp.shape_type == "chart" and _is_trend_chart(fp.categories)
+    is_segment = (
+        fp.shape_type == "chart"
+        and not is_trend
+        and _is_segment_chart(fp.categories, col_banners_pool or set())
+    )
+
+    # Get first series values for correlation
+    first_series_vals = []
+    if fp.series_values:
+        first_series_vals = [v for v in fp.series_values[0] if v is not None]
+    elif fp.values_sample:
+        first_series_vals = fp.values_sample
+
+    candidates: List[MapCandidate] = []
+
+    for t in tables:
+        # --- Value correlation ---
+        val_score = 0.0
+        matched_row = None
+
+        if first_series_vals and len(first_series_vals) >= 3:
+            if is_trend:
+                val_score, matched_row = _value_correlation_timeseries(
+                    first_series_vals, fp.categories, t,
+                )
+            elif is_segment:
+                val_score, matched_row = _value_correlation_segment(
+                    first_series_vals, fp.categories, t,
+                )
+            else:
+                val_score = _value_correlation_distribution(
+                    first_series_vals, fp.categories, t,
+                )
+
+        # --- Label overlap ---
+        row_sim, col_sim, orient = _label_overlap_score(fp, t)
+        uninformative = _is_uninformative_series(fp.series_names) if fp.shape_type == "chart" else False
+        rw = 1.0 if uninformative else _LABEL_ROW_WEIGHT
+        cw = 0.0 if uninformative else _LABEL_COL_WEIGHT
+        label_score = rw * row_sim + cw * col_sim
+
+        # --- Slide context ---
+        ctx_score = _slide_context_score(slide_ctx, t)
+
+        # --- Series-to-row matching ---
+        series_score = 0.0
+        series_matched_row = None
+        if fp.shape_type == "chart":
+            series_score, series_matched_row = _series_name_score(fp.series_names, t)
+
+        # If segment/trend correlation identified a row, prefer that; else use series match
+        if matched_row is None and series_matched_row:
+            matched_row = series_matched_row
+
+        # --- Blend ---
+        # For time series and segment charts, value correlation is more important
+        if is_trend or is_segment:
+            w_val = 0.55
+            w_label = 0.15
+            w_ctx = 0.20
+            w_series = 0.10
+        else:
+            w_val = WEIGHT_VALUE_CORR
+            w_label = WEIGHT_LABEL_OVERLAP
+            w_ctx = WEIGHT_SLIDE_CONTEXT
+            w_series = WEIGHT_SERIES_NAME
+
+        # If no value data available, redistribute weight to other signals
+        if not first_series_vals or len(first_series_vals) < 3:
+            w_label += w_val * 0.5
+            w_ctx += w_val * 0.3
+            w_series += w_val * 0.2
+            w_val = 0.0
+
+        final_score = (
+            w_val * val_score
+            + w_label * label_score
+            + w_ctx * ctx_score
+            + w_series * series_score
+        )
+
+        # Override orientation for segment/trend charts
+        if is_segment:
+            orient = "flipped"
+        elif is_trend:
+            orient = "timeseries"
+
         candidates.append(MapCandidate(
-            table=t, score=best_score,
-            row_score=best_row, col_score=best_col,
-            orientation=best_orient,
+            table=t,
+            score=final_score,
+            value_corr_score=val_score,
+            label_score=label_score,
+            context_score=ctx_score,
+            series_score=series_score,
+            row_score=row_sim,
+            col_score=col_sim,
+            orientation=orient,
+            matched_row=matched_row,
         ))
 
     candidates.sort(key=lambda c: c.score, reverse=True)
     return candidates
 
 
+# Also keep the old function name for backward compat
+def score_fingerprint_against_tables(
+    fp: ShapeFingerprint,
+    tables: List[Dict[str, Any]],
+) -> List[MapCandidate]:
+    """Legacy wrapper — calls score_fingerprint_blended without context signals."""
+    return score_fingerprint_blended(fp, tables)
+
+
 # ---------------------------------------------------------------------------
-# LLM disambiguation
+# LLM disambiguation (enhanced with richer context)
 # ---------------------------------------------------------------------------
 
 def _llm_disambiguate(
     fp: ShapeFingerprint,
     candidates: List[MapCandidate],
+    slide_ctx: Optional[SlideContext] = None,
     max_candidates: int = 5,
 ) -> Optional[Tuple[MapCandidate, str]]:
-    """Use an LLM to pick the best candidate when structural scoring is ambiguous.
-
-    Returns (chosen_candidate, reason) or None.
-    """
+    """Use an LLM to pick the best candidate when scoring is ambiguous."""
     try:
         from openai import OpenAI
     except ImportError:
@@ -391,24 +1115,33 @@ def _llm_disambiguate(
     else:
         return None
 
+    # Add slide context to help the LLM
+    if slide_ctx:
+        shape_info["slide_question_text"] = slide_ctx.question_text[:200] if slide_ctx.question_text else ""
+        shape_info["slide_chart_title"] = slide_ctx.chart_title[:100] if slide_ctx.chart_title else ""
+        shape_info["slide_q_code"] = slide_ctx.q_code or ""
+
     prompt_candidates = []
     for i, c in enumerate(top):
         prompt_candidates.append({
             "index": i,
             "title": c.table.get("title", ""),
             "row_labels": c.table.get("row_labels", [])[:15],
-            "col_labels": c.table.get("col_labels", []),
-            "structural_score": round(c.score, 3),
+            "col_labels": c.table.get("col_labels", [])[:10],
+            "value_correlation": round(c.value_corr_score, 3),
+            "label_overlap": round(c.label_score, 3),
+            "context_score": round(c.context_score, 3),
         })
 
     user_msg = (
-        "I have a PowerPoint shape that needs to be matched to one of several "
-        "crosstab data tables. The shape's existing data was extracted as follows:\n\n"
+        "I have a PowerPoint chart/table shape that needs to be matched to one of "
+        "several crosstab data tables. The shape's existing data was extracted as follows:\n\n"
         f"Shape: {json.dumps(shape_info)}\n\n"
-        "Candidate tables from the new crosstab data:\n"
+        "Candidate tables from the crosstab data (with algorithmic scores):\n"
         f"{json.dumps(prompt_candidates)}\n\n"
-        "Which candidate table is the best match for this shape? "
-        "Consider overlap in row labels (categories) and column labels (series/banners). "
+        "Which candidate table is the best match? Consider: value correlation scores "
+        "(higher = chart data pattern matches table data pattern), label overlap, "
+        "and whether the slide's question text matches the table title.\n\n"
         'Return JSON: {"best_index": <int or null>, "reason": "<one sentence>"}'
     )
 
@@ -445,12 +1178,18 @@ class AutoMapResult:
     table_title: Optional[str]
     col_key: Optional[str]
     confidence: float
-    method: str  # "qcode" | "structural" | "llm" | "slide_context" | "trend_skip" | "unmatched"
+    method: str  # "qcode" | "structural" | "blended" | "llm" | "slide_context" | "trend_match" | "unmatched"
     reason: str = ""
     candidates: List[MapCandidate] = field(default_factory=list)
     orientation: str = "normal"
     row_key: Optional[str] = None
     column_keys: Optional[List[str]] = None
+    # Sub-scores for UI display
+    value_corr_score: float = 0.0
+    label_score: float = 0.0
+    context_score: float = 0.0
+    series_score: float = 0.0
+    matched_row: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -470,6 +1209,10 @@ def _build_alt_text(
     lines = [f"table_title: {table_title}"]
     if orientation == "flipped" and row_key:
         lines.append(f"row_key: {row_key}")
+    if orientation == "timeseries":
+        lines.append("chart_mode: timeseries")
+        if row_key:
+            lines.append(f"row_key: {row_key}")
     if column_keys:
         lines.append(f"column: {','.join(column_keys)}")
     elif col_key:
@@ -480,19 +1223,19 @@ def _build_alt_text(
         lines.append("type: table")
     if orientation == "flipped":
         lines.append("orientation: flipped")
+    elif orientation == "timeseries":
+        lines.append("orientation: timeseries")
     lines.append("auto_update: yes")
     return "\n".join(lines)
 
 
 def _build_text_alt_text(table_title: str, text_type: str) -> str:
-    """Build alt text for associated text shapes."""
     return f"type: {text_type}\ntable_title: {table_title}"
 
 
 def _write_alt_text(shape, alt_text: str):
     """Write alt text onto a shape's cNvPr descr attribute."""
     el = shape.element
-
     c_nv_pr = el.find(
         ".//p:cNvPr",
         namespaces={"p": P_NS},
@@ -500,7 +1243,6 @@ def _write_alt_text(shape, alt_text: str):
     if c_nv_pr is not None:
         c_nv_pr.set("descr", alt_text)
         return
-
     try:
         shape.alternative_text = alt_text
     except (AttributeError, ValueError):
@@ -508,7 +1250,6 @@ def _write_alt_text(shape, alt_text: str):
 
 
 def _read_existing_alt(shape) -> str:
-    """Read existing alt text from a shape."""
     try:
         el = shape.element
         c_nv_pr = el.find(
@@ -530,10 +1271,6 @@ def _read_existing_alt(shape) -> str:
 # ---------------------------------------------------------------------------
 
 def _classify_text_shape(text: str) -> Optional[str]:
-    """Guess the type of a text shape based on its content.
-
-    Returns "text_question", "text_base", "text_title", or None.
-    """
     lower = text.strip().lower()
     if lower.startswith("question:") or lower.startswith("q:"):
         return "text_question"
@@ -548,11 +1285,6 @@ def associate_text_shapes(
     prs: Presentation,
     map_results: List[AutoMapResult],
 ) -> List[AutoMapResult]:
-    """For each slide that has a matched chart/table, associate nearby text shapes
-    with the same table using content heuristics.
-
-    Returns new AutoMapResult entries for the associated text shapes.
-    """
     slide_to_table: Dict[int, str] = {}
     for r in map_results:
         if r.table_title and r.fingerprint.shape_type in ("chart", "table"):
@@ -571,7 +1303,6 @@ def associate_text_shapes(
             existing_alt = _read_existing_alt(shape)
             if existing_alt and "table_title" in existing_alt.lower():
                 continue
-
             is_data_shape = False
             try:
                 _ = shape.chart
@@ -582,17 +1313,14 @@ def associate_text_shapes(
                 is_data_shape = True
             if is_data_shape:
                 continue
-
             if not hasattr(shape, "text_frame"):
                 continue
             text = shape.text_frame.text.strip()
             if not text or len(text) < 3:
                 continue
-
             text_type = _classify_text_shape(text)
             if text_type is None:
                 continue
-
             fp = ShapeFingerprint(
                 slide_idx=slide_idx,
                 shape_idx=shape_idx,
@@ -613,12 +1341,95 @@ def associate_text_shapes(
 
 
 # ---------------------------------------------------------------------------
-# Orchestrator
+# Key inference helpers
 # ---------------------------------------------------------------------------
 
-HIGH_CONFIDENCE_THRESHOLD = 0.70
-LLM_THRESHOLD = 0.40
+def _infer_col_key(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[str]:
+    col_labels = table.get("col_labels", [])
+    if not col_labels:
+        return None
+    if fp.shape_type == "chart" and len(fp.series_names) == 1:
+        sn = fp.series_names[0]
+        if sn in col_labels:
+            return sn
+    for preferred in ["Total", "Overall", "All", "Base"]:
+        if preferred in col_labels:
+            return preferred
+    return col_labels[0] if col_labels else None
 
+
+def _infer_row_key(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[str]:
+    row_labels = table.get("row_labels", [])
+    if not row_labels or not fp.series_names:
+        return None
+    for sn in fp.series_names:
+        if not sn or _norm(sn) in _UNINFORMATIVE_SERIES:
+            continue
+        if sn in row_labels:
+            return sn
+        fuzzy = _fuzzy_match_label(sn, row_labels, threshold=0.55)
+        if fuzzy:
+            return fuzzy
+    return None
+
+
+def _infer_column_keys(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[List[str]]:
+    col_labels = table.get("col_labels", [])
+    if not col_labels or not fp.categories:
+        return None
+    keys: List[str] = []
+    for cat in fp.categories:
+        if cat in col_labels:
+            keys.append(cat)
+        else:
+            fuzzy = _fuzzy_match_label(cat, col_labels, threshold=0.6)
+            if fuzzy:
+                keys.append(fuzzy)
+    return keys if keys else None
+
+
+def _infer_column_keys_from_banners(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[List[str]]:
+    """For segment breakout charts: map chart categories to crosstab column banners."""
+    banners = table.get("meta", {}).get("col_banners", [])
+    col_labels = table.get("col_labels", [])
+    if not banners or not fp.categories:
+        return None
+
+    seg_map = _build_segment_mapping(fp.categories, banners)
+    if not seg_map:
+        return None
+
+    # Return the actual col_labels (which may include metric qualifiers like "Total | %")
+    keys = []
+    for ci in sorted(seg_map.keys()):
+        bi = seg_map[ci]
+        if bi < len(col_labels):
+            keys.append(col_labels[bi])
+        elif bi < len(banners):
+            keys.append(banners[bi])
+    return keys if keys else None
+
+
+def _infer_keys(
+    fp: ShapeFingerprint,
+    table: Dict[str, Any],
+    orientation: str,
+    matched_row: Optional[str] = None,
+) -> Tuple[Optional[str], Optional[str], Optional[List[str]]]:
+    """Return (col_key, row_key, column_keys) appropriate for orientation."""
+    if orientation == "flipped":
+        row_key = matched_row or _infer_row_key(fp, table)
+        column_keys = _infer_column_keys_from_banners(fp, table) or _infer_column_keys(fp, table)
+        return None, row_key, column_keys
+    elif orientation == "timeseries":
+        row_key = matched_row or _infer_row_key(fp, table)
+        return None, row_key, None
+    return _infer_col_key(fp, table), None, None
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
 
 def auto_map_presentation(
     pptx_in: str,
@@ -629,21 +1440,9 @@ def auto_map_presentation(
     write_alt: bool = True,
     progress_callback=None,
 ) -> List[AutoMapResult]:
-    """Run the full auto-mapping pipeline.
-
-    1. Parse the crosstab workbook.
-    2. Extract fingerprints from all PPTX shapes.
-    3. Score each fingerprint against tables (structural).
-    4. Use LLM for ambiguous matches if enabled.
-    5. Associate text shapes via slide context.
-    6. Optionally write alt text onto matched shapes and save.
-
-    Returns the list of AutoMapResult for UI review.
-    """
     prs = Presentation(pptx_in)
     data = parse_workbook(crosstab_xlsx)
     tables = data["tables"]
-
     return auto_map_presentation_obj(
         prs, tables,
         pptx_out=pptx_out,
@@ -662,12 +1461,28 @@ def auto_map_presentation_obj(
     write_alt: bool = True,
     progress_callback=None,
 ) -> List[AutoMapResult]:
-    """Core auto-mapping logic operating on already-loaded objects.
+    """Core auto-mapping logic with multi-signal blended scoring.
 
-    Useful when the Streamlit app already has the Presentation and tables loaded.
+    v2 changes:
+    - Value correlation as primary matching signal
+    - Slide context (question text, Q-codes) as secondary signal
+    - Series-to-row fuzzy matching
+    - Time series charts are matched (not skipped)
+    - Enhanced LLM fallback with richer context
     """
     fingerprints = extract_all_fingerprints(prs)
     data_fps = [fp for fp in fingerprints if fp.shape_type in ("chart", "table")]
+
+    # Extract slide contexts
+    slide_contexts = _extract_slide_contexts(prs)
+
+    # Build pool of all column banners for segment detection
+    col_banners_pool: set = set()
+    for t in tables:
+        banners = t.get("meta", {}).get("col_banners", t.get("col_labels", []))
+        for b in banners:
+            if b and isinstance(b, str):
+                col_banners_pool.add(_norm(b))
 
     # Build Q-code → table index for Tier 0 matching
     qcode_index: Dict[str, List[Dict[str, Any]]] = {}
@@ -680,16 +1495,7 @@ def auto_map_presentation_obj(
     total = len(data_fps) or 1
 
     for i, fp in enumerate(data_fps):
-        # --- Trend chart detection: skip historical time-series charts ---
-        if fp.shape_type == "chart" and _is_trend_chart(fp.categories):
-            results.append(AutoMapResult(
-                fingerprint=fp, table_title=None, col_key=None,
-                confidence=0.0, method="trend_skip",
-                reason="Historical trend chart — not updatable from single-wave crosstab",
-            ))
-            if progress_callback:
-                progress_callback((i + 1) / total)
-            continue
+        slide_ctx = slide_contexts.get(fp.slide_idx)
 
         # --- Tier 0: Q-code match from existing alt text ---
         fp_qcode = _extract_qcode(fp.existing_alt)
@@ -706,8 +1512,11 @@ def auto_map_presentation_obj(
                 progress_callback((i + 1) / total)
             continue
 
-        # --- Structural scoring ---
-        candidates = score_fingerprint_against_tables(fp, tables)
+        # --- Blended multi-signal scoring ---
+        candidates = score_fingerprint_blended(
+            fp, tables, slide_ctx=slide_ctx, col_banners_pool=col_banners_pool,
+        )
+
         if not candidates:
             results.append(AutoMapResult(
                 fingerprint=fp, table_title=None, col_key=None,
@@ -722,23 +1531,37 @@ def auto_map_presentation_obj(
 
         if best.score >= HIGH_CONFIDENCE_THRESHOLD:
             orient = best.orientation
-            col_key, row_key, column_keys = _infer_keys(fp, best.table, orient)
+            col_key, row_key, column_keys = _infer_keys(
+                fp, best.table, orient, matched_row=best.matched_row,
+            )
             title = best.table["title"]
             results.append(AutoMapResult(
                 fingerprint=fp, table_title=title, col_key=col_key,
-                confidence=best.score, method="structural",
-                reason=f"Row overlap {best.row_score:.0%}, col overlap {best.col_score:.0%}",
+                confidence=best.score, method="blended",
+                reason=(
+                    f"Val r={best.value_corr_score:.2f}, "
+                    f"Labels={best.label_score:.2f}, "
+                    f"Ctx={best.context_score:.2f}, "
+                    f"Series={best.series_score:.2f}"
+                ),
                 candidates=candidates[:5],
                 orientation=orient,
                 row_key=row_key,
                 column_keys=column_keys,
+                value_corr_score=best.value_corr_score,
+                label_score=best.label_score,
+                context_score=best.context_score,
+                series_score=best.series_score,
+                matched_row=best.matched_row,
             ))
         elif best.score >= LLM_THRESHOLD and use_llm:
-            llm_result = _llm_disambiguate(fp, candidates)
+            llm_result = _llm_disambiguate(fp, candidates, slide_ctx=slide_ctx)
             if llm_result:
                 chosen, reason = llm_result
                 orient = chosen.orientation
-                col_key, row_key, column_keys = _infer_keys(fp, chosen.table, orient)
+                col_key, row_key, column_keys = _infer_keys(
+                    fp, chosen.table, orient, matched_row=chosen.matched_row,
+                )
                 title = chosen.table["title"]
                 results.append(AutoMapResult(
                     fingerprint=fp, table_title=title, col_key=col_key,
@@ -748,6 +1571,11 @@ def auto_map_presentation_obj(
                     orientation=orient,
                     row_key=row_key,
                     column_keys=column_keys,
+                    value_corr_score=chosen.value_corr_score,
+                    label_score=chosen.label_score,
+                    context_score=chosen.context_score,
+                    series_score=chosen.series_score,
+                    matched_row=chosen.matched_row,
                 ))
             else:
                 results.append(AutoMapResult(
@@ -776,6 +1604,8 @@ def auto_map_presentation_obj(
         slides = list(prs.slides)
         for r in results:
             if r.table_title is None:
+                continue
+            if r.confidence < ALT_TEXT_WRITE_THRESHOLD:
                 continue
             fp = r.fingerprint
             if fp.slide_idx >= len(slides):
@@ -815,71 +1645,8 @@ def auto_map_presentation_obj(
     return results
 
 
-def _infer_col_key(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[str]:
-    """Try to infer the column key (data series) from the fingerprint."""
-    col_labels = table.get("col_labels", [])
-    if not col_labels:
-        return None
-
-    if fp.shape_type == "chart" and len(fp.series_names) == 1:
-        sn = fp.series_names[0]
-        if sn in col_labels:
-            return sn
-
-    for preferred in ["Total", "Overall", "All", "Base"]:
-        if preferred in col_labels:
-            return preferred
-
-    return col_labels[0] if col_labels else None
-
-
-def _infer_row_key(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[str]:
-    """For flipped charts, resolve the series name to an actual table row label."""
-    row_labels = table.get("row_labels", [])
-    if not row_labels or not fp.series_names:
-        return None
-    for sn in fp.series_names:
-        if not sn or _norm(sn) in _UNINFORMATIVE_SERIES:
-            continue
-        if sn in row_labels:
-            return sn
-        fuzzy = _fuzzy_match_label(sn, row_labels, threshold=0.55)
-        if fuzzy:
-            return fuzzy
-    return None
-
-
-def _infer_column_keys(fp: ShapeFingerprint, table: Dict[str, Any]) -> Optional[List[str]]:
-    """For flipped charts, map chart categories back to table column labels."""
-    col_labels = table.get("col_labels", [])
-    if not col_labels or not fp.categories:
-        return None
-    keys: List[str] = []
-    for cat in fp.categories:
-        if cat in col_labels:
-            keys.append(cat)
-        else:
-            fuzzy = _fuzzy_match_label(cat, col_labels, threshold=0.6)
-            if fuzzy:
-                keys.append(fuzzy)
-    return keys if keys else None
-
-
-def _infer_keys(
-    fp: ShapeFingerprint,
-    table: Dict[str, Any],
-    orientation: str,
-) -> Tuple[Optional[str], Optional[str], Optional[List[str]]]:
-    """Return ``(col_key, row_key, column_keys)`` appropriate for *orientation*."""
-    if orientation == "flipped":
-        row_key = _infer_row_key(fp, table)
-        column_keys = _infer_column_keys(fp, table)
-        return None, row_key, column_keys
-    return _infer_col_key(fp, table), None, None
-
-
 # ---------------------------------------------------------------------------
-# Convenience: get a summary report for the UI
+# Report for UI
 # ---------------------------------------------------------------------------
 
 def results_to_report(results: List[AutoMapResult]) -> List[dict]:
@@ -897,10 +1664,19 @@ def results_to_report(results: List[AutoMapResult]) -> List[dict]:
             "reason": r.reason,
             "orientation": r.orientation,
             "row_key": r.row_key,
+            "matched_row": r.matched_row,
+            "value_corr_score": round(r.value_corr_score, 3),
+            "label_score": round(r.label_score, 3),
+            "context_score": round(r.context_score, 3),
+            "series_score": round(r.series_score, 3),
             "candidates": [
                 {
                     "title": c.table.get("title", ""),
                     "score": round(c.score, 3),
+                    "value_corr": round(c.value_corr_score, 3),
+                    "label": round(c.label_score, 3),
+                    "context": round(c.context_score, 3),
+                    "series": round(c.series_score, 3),
                     "row_score": round(c.row_score, 3),
                     "col_score": round(c.col_score, 3),
                 }

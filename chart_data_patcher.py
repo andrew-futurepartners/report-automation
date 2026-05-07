@@ -287,3 +287,83 @@ def patch_chart_series(
         "patch_chart_series: patched %d series (format=%s)",
         len(series_data), value_format,
     )
+
+
+def append_chart_point(
+    chart,
+    category_label: str,
+    series_values: list,
+):
+    """Append a single new data point to an existing chart.
+
+    Reads the current categories and values from each series cache,
+    appends the new point, and rebuilds the caches. All formatting
+    is preserved because only the caches are touched.
+    """
+    chart_tree = chart.part._element
+    plot = _find_plot(chart_tree)
+    if plot is None:
+        logger.warning("append_chart_point: no plot element found")
+        return
+
+    all_ser = plot.findall(f"{_C}ser")
+    if not all_ser:
+        logger.warning("append_chart_point: no c:ser elements found")
+        return
+
+    # Read existing categories from the first series
+    first_ser = all_ser[0]
+    cat_el = first_ser.find(f"{_C}cat")
+    existing_cats = []
+    if cat_el is not None:
+        str_ref = cat_el.find(f"{_C}strRef")
+        cache_parent = str_ref if str_ref is not None else cat_el
+        str_cache = cache_parent.find(f"{_C}strCache")
+        if str_cache is not None:
+            for pt in str_cache.findall(f"{_C}pt"):
+                v_el = pt.find(f"{_C}v")
+                existing_cats.append(v_el.text if v_el is not None and v_el.text else "")
+
+    new_cats = existing_cats + [category_label]
+
+    # Detect format code from existing cache
+    fmt_code = "General"
+    val_el_first = _ensure_val(first_ser)
+    num_ref = val_el_first.find(f"{_C}numRef")
+    vp = num_ref if num_ref is not None else val_el_first
+    nc = vp.find(f"{_C}numCache")
+    if nc is not None:
+        fc_el = nc.find(f"{_C}formatCode")
+        if fc_el is not None and fc_el.text:
+            fmt_code = fc_el.text
+
+    # Update each series
+    for si, ser in enumerate(all_ser):
+        val_el = _ensure_val(ser)
+        num_ref = val_el.find(f"{_C}numRef")
+        vp = num_ref if num_ref is not None else val_el
+        nc = vp.find(f"{_C}numCache")
+
+        old_vals = []
+        if nc is not None:
+            pt_count_el = nc.find(f"{_C}ptCount")
+            count = int(pt_count_el.get("val", "0")) if pt_count_el is not None else 0
+            old_vals = [None] * count
+            for pt in nc.findall(f"{_C}pt"):
+                idx = int(pt.get("idx", "-1"))
+                v_el = pt.find(f"{_C}v")
+                if 0 <= idx < count and v_el is not None and v_el.text:
+                    try:
+                        old_vals[idx] = float(v_el.text)
+                    except (ValueError, TypeError):
+                        pass
+
+        new_val = series_values[si] if si < len(series_values) else None
+        new_vals = old_vals + [new_val]
+
+        cat_el = _ensure_cat(ser)
+        _rebuild_str_cache(cat_el, new_cats)
+        _rebuild_num_cache(val_el, new_vals, fmt_code)
+
+    logger.debug("append_chart_point: appended '%s' with %d series values",
+                 category_label, len(series_values))

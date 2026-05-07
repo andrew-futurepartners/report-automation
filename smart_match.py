@@ -2,7 +2,7 @@
 smart_match.py — Three-tier intelligent matching for PowerPoint shapes to crosstab tables.
 
 Tier 1: Exact match (normalize whitespace/case, compare table_title)
-Tier 2: Fuzzy structural match (title similarity + row/col Jaccard overlap)
+Tier 2: Fuzzy structural match (title similarity + row/col Jaccard overlap + fuzzy row containment)
 Tier 3: Optional LLM-assisted match for ambiguous cases (cached per session)
 """
 
@@ -73,6 +73,20 @@ def _jaccard(a: set, b: set) -> float:
         return 0.0
     return len(a & b) / len(union)
 
+
+
+
+# ---------------------------------------------------------------------------
+# Q-code helpers
+# ---------------------------------------------------------------------------
+
+_QCODE_RE = re.compile(r"\(Q\d+[_\d]*\)")
+
+
+def _extract_qcode(text: str) -> Optional[str]:
+    """Extract a question code like ``(Q1369)`` from arbitrary text."""
+    m = _QCODE_RE.search(text or "")
+    return m.group() if m else None
 
 # ---------------------------------------------------------------------------
 # SmartMatcher
@@ -296,6 +310,15 @@ class SmartMatcher:
             norm_key = _norm(alt_title)
             table = self._norm_map.get(norm_key)
 
+        # Q-code match: if alt_title contains a Q-code, try matching that
+        if not table and alt_title:
+            qc = _extract_qcode(alt_title)
+            if qc:
+                for t in self._tables:
+                    if qc in t.get("title", ""):
+                        table = t
+                        break
+
         # Shape name fallbacks: CHART_ / TABLE_ / CHART: / TABLE:
         if not table:
             table, col_key = self._name_fallback(name, col_key)
@@ -326,6 +349,7 @@ class SmartMatcher:
         norm_alt = _norm(alt_title)
         alt_row_hash = alt.get("row_hash")
         alt_col_hash = alt.get("col_hash")
+        alt_qcode = _extract_qcode(alt_title)
 
         candidates: List[MatchCandidate] = []
 
@@ -334,10 +358,17 @@ class SmartMatcher:
             if not t_title:
                 continue
 
+            # Q-code boost
+            qcode_boost = 0.0
+            if alt_qcode:
+                t_qcode = _extract_qcode(t.get("title", ""))
+                if t_qcode and alt_qcode == t_qcode:
+                    qcode_boost = 0.5
+
             # Title similarity (SequenceMatcher)
             title_sim = SequenceMatcher(None, norm_alt, t_title).ratio()
 
-            # Row label Jaccard
+            # Row label matching (Jaccard + fuzzy containment)
             row_sim = 0.0
             if alt_row_hash:
                 t_row_hash = label_hash(t.get("row_labels", []))
@@ -346,7 +377,18 @@ class SmartMatcher:
                 alt_rows = {_norm(r) for r in alt.get("row_labels", [])}
                 t_rows   = {_norm(r) for r in t.get("row_labels", [])}
                 if alt_rows or t_rows:
-                    row_sim = _jaccard(alt_rows, t_rows)
+                    jacc = _jaccard(alt_rows, t_rows)
+                    fuzzy_hits = 0
+                    for ar in alt_rows:
+                        if ar in t_rows:
+                            fuzzy_hits += 1
+                        else:
+                            for tr in t_rows:
+                                if SequenceMatcher(None, ar, tr).ratio() >= 0.7:
+                                    fuzzy_hits += 1
+                                    break
+                    fuzzy_contain = fuzzy_hits / len(alt_rows) if alt_rows else 0.0
+                    row_sim = max(jacc, fuzzy_contain)
 
             # Column label Jaccard
             col_sim = 0.0
@@ -359,10 +401,11 @@ class SmartMatcher:
                 if alt_cols or t_cols:
                     col_sim = _jaccard(alt_cols, t_cols)
 
-            combined = (
+            combined = min(1.0,
                 TITLE_WEIGHT * title_sim
                 + ROW_WEIGHT * row_sim
                 + COL_WEIGHT * col_sim
+                + qcode_boost
             )
 
             candidates.append(MatchCandidate(

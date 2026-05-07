@@ -8,11 +8,12 @@ formatting), refreshes table cells, question/base/title text, and callouts.
 import logging
 import math
 import re
+from difflib import SequenceMatcher
 from typing import Dict, Any, List, Optional, Tuple
 
 from pptx import Presentation
 
-from chart_data_patcher import detect_value_format, patch_chart_data, patch_chart_series
+from chart_data_patcher import detect_value_format, patch_chart_data, patch_chart_series, append_chart_point
 from crosstab_parser import parse_workbook
 from smart_match import SmartMatcher
 from text_utils import (
@@ -227,6 +228,131 @@ def _flipped_series_from_table(
     return cats, vals
 
 
+
+def _normalise_date_label(label: str):
+    """Normalise a date string to 'mon yyyy' for comparison."""
+    _MONTH_MAP = {
+        "jan": "jan", "feb": "feb", "mar": "mar", "apr": "apr",
+        "may": "may", "jun": "jun", "jul": "jul", "aug": "aug",
+        "sep": "sep", "oct": "oct", "nov": "nov", "dec": "dec",
+        "january": "jan", "february": "feb", "march": "mar",
+        "april": "apr", "june": "jun", "july": "jul", "august": "aug",
+        "september": "sep", "october": "oct", "november": "nov",
+        "december": "dec",
+    }
+    if not label:
+        return None
+    s = label.strip().lower()
+    m = re.match(r"(\w+)\s+(\d{4})", s)
+    if m:
+        month_str = m.group(1)
+        year = m.group(2)
+        key = _MONTH_MAP.get(month_str)
+        if key:
+            return f"{key} {year}"
+    m = re.match(r"(\w+)\s+\d{1,2}(?:[,-]\s*(?:\w+\s+)?\d{1,2})?,?\s*(\d{4})", s)
+    if m:
+        month_str = m.group(1)
+        year = m.group(2)
+        key = _MONTH_MAP.get(month_str)
+        if key:
+            return f"{key} {year}"
+    return None
+
+
+def _update_timeseries_chart(chart, table, row_key):
+    """Update a time-series chart by appending new data points."""
+    import math as _math
+    existing_cats = []
+    try:
+        for pt in chart.plots[0].categories:
+            if pt is not None:
+                existing_cats.append(str(pt))
+    except Exception:
+        logger.warning("Could not read existing categories from time-series chart")
+        return
+    if not existing_cats:
+        return
+    existing_date_keys = set()
+    for cat in existing_cats:
+        dk = _normalise_date_label(cat)
+        if dk:
+            existing_date_keys.add(dk)
+    col_labels = table.get("col_labels", [])
+    banners = table.get("meta", {}).get("col_banners", col_labels)
+    values = table.get("values", [])
+    row_labels = table.get("row_labels", [])
+    new_dates = []
+    for ci, banner in enumerate(banners):
+        dk = _normalise_date_label(str(banner))
+        if dk and dk not in existing_date_keys:
+            display = str(banner).strip()
+            m = re.match(r"(\w+)(\s+\d{4})", display)
+            if m and len(m.group(1)) > 3:
+                display = m.group(1)[:3] + m.group(2)
+            new_dates.append((ci, display))
+    if not new_dates:
+        logger.info("Time-series chart already up to date")
+        return
+    series_info = []
+    try:
+        for s in chart.series:
+            try:
+                sname = str(s.name) if s.name else ""
+            except Exception:
+                sname = ""
+            series_info.append(sname)
+    except Exception:
+        series_info = [""]
+    for col_idx, display_label in new_dates:
+        series_values = []
+        for si, sname in enumerate(series_info):
+            target_row_idx = None
+            if row_key:
+                for ri, rl in enumerate(row_labels):
+                    if _norm(rl) == _norm(row_key):
+                        target_row_idx = ri
+                        break
+                    if SequenceMatcher(None, _norm(row_key), _norm(rl)).ratio() >= 0.6:
+                        target_row_idx = ri
+                        break
+            if target_row_idx is None and sname and _norm(sname) not in ("", "%", "series 1", "series1"):
+                for ri, rl in enumerate(row_labels):
+                    nrl = _norm(rl)
+                    if nrl.startswith(("base", "mean", "average", "avg")):
+                        continue
+                    ns = _norm(sname)
+                    if ns == nrl or ns in nrl or nrl in ns:
+                        target_row_idx = ri
+                        break
+                    if SequenceMatcher(None, ns, nrl).ratio() >= 0.55:
+                        target_row_idx = ri
+                        break
+                if target_row_idx is None:
+                    for ri, rl in enumerate(row_labels):
+                        if _norm(rl).startswith("top") and "box" in _norm(rl):
+                            target_row_idx = ri
+                            break
+            if target_row_idx is None:
+                data_rows = [ri for ri, rl in enumerate(row_labels)
+                             if not _norm(rl).startswith(("base", "mean", "average", "avg"))]
+                if len(data_rows) == 1:
+                    target_row_idx = data_rows[0]
+            val = None
+            if target_row_idx is not None and target_row_idx < len(values):
+                row_vals = values[target_row_idx]
+                if col_idx < len(row_vals) and row_vals[col_idx] is not None:
+                    try:
+                        val = float(row_vals[col_idx])
+                        if _math.isnan(val) or _math.isinf(val):
+                            val = None
+                    except (ValueError, TypeError):
+                        val = None
+            series_values.append(val)
+        append_chart_point(chart, display_label, series_values)
+        logger.info("Appended time-series point: %s (table: %s)", display_label, table.get("title", "")[:60])
+
+
 def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str],
                   explicit_rows: Optional[List[str]],
                   exclude_terms: Optional[List[str]] = None,
@@ -235,6 +361,12 @@ def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str],
     chart = shape.chart
     alt = _parse_alt_text(shape)
     ex = _exclude_indices(table["row_labels"], exclude_terms)
+
+    # --- Time-series orientation: append new data points ---
+    if alt.get("orientation") == "timeseries" or alt.get("chart_mode") == "timeseries":
+        row_key = alt.get("row_key", alt.get("row key", ""))
+        _update_timeseries_chart(chart, table, row_key)
+        return
 
     # --- Flipped orientation: categories = columns, series = one row ---
     if alt.get("orientation") == "flipped":
