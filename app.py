@@ -9,6 +9,7 @@ from deck_update import update_presentation, update_presentation_with_unmapped, 
 from pptx import Presentation
 from smart_match import SmartMatcher
 from ai_insights import generate_all_insights
+from auto_mapper import auto_map_presentation_obj, results_to_report, _read_existing_alt
 from text_utils import format_number_with_commas, parse_base_text, format_base_text
 
 logging.basicConfig(
@@ -347,10 +348,19 @@ else:
     existing_ppt = st.file_uploader("Upload the PowerPoint to update", type=["pptx"], key="existing_ppt")
     
     if existing_ppt:
-        with st.spinner("Parsing existing PowerPoint..."):
-            existing_content = parse_existing_powerpoint(existing_ppt)
-            st.session_state.existing_content = existing_content
-            _save_temp(existing_ppt, ".pptx", "_tmp_pptx")
+        # Only re-parse and re-save if this is a fresh upload (not a page rerun).
+        # Detect fresh upload by comparing the file's id to what we last processed.
+        _ppt_file_id = id(existing_ppt)
+        if st.session_state.get("_ppt_file_id") != _ppt_file_id or "_tmp_pptx" not in st.session_state:
+            with st.spinner("Parsing existing PowerPoint..."):
+                existing_content = parse_existing_powerpoint(existing_ppt)
+                st.session_state.existing_content = existing_content
+                _save_temp(existing_ppt, ".pptx", "_tmp_pptx")
+                st.session_state["_ppt_file_id"] = _ppt_file_id
+                st.session_state.pop("auto_map_applied", None)
+                st.session_state.pop("auto_map_report", None)
+
+        existing_content = st.session_state.existing_content
 
         if existing_content:
             st.success(f"Found connections for {len(existing_content)} tables")
@@ -369,10 +379,15 @@ else:
         uploaded = st.file_uploader("Upload crosstab Excel", type=["xlsx", "xls"], key="update_report_excel")
         
         if uploaded:
-            with st.spinner("Parsing workbook..."):
-                xlsx_path = _save_temp(uploaded, ".xlsx", "_tmp_xlsx")
-                data = parse_workbook(xlsx_path)
-                st.session_state.data = data
+            _xlsx_file_id = id(uploaded)
+            if st.session_state.get("_xlsx_file_id") != _xlsx_file_id or st.session_state.data is None:
+                with st.spinner("Parsing workbook..."):
+                    xlsx_path = _save_temp(uploaded, ".xlsx", "_tmp_xlsx")
+                    data = parse_workbook(xlsx_path)
+                    st.session_state.data = data
+                    st.session_state["_xlsx_file_id"] = _xlsx_file_id
+            
+            data = st.session_state.data
 
             st.success(f"Found {len(data['tables'])} tables in crosstab")
             
@@ -1020,13 +1035,72 @@ if st.session_state.data is not None:
             - Custom formatting and content will be preserved where possible
             """)
             
-            # --- Match review ---
+            # --- Auto-Map & Match review ---
             if "match_review" not in st.session_state:
                 st.session_state.match_review = None
             if "match_overrides" not in st.session_state:
                 st.session_state.match_overrides = {}
+            if "auto_map_report" not in st.session_state:
+                st.session_state.auto_map_report = None
+            if "auto_map_applied" not in st.session_state:
+                st.session_state.auto_map_applied = False
 
-            if st.button("Preview Matches", key="preview_matches"):
+            # Check if the deck has pre-existing alt text mappings
+            _has_existing_alt = bool(existing_content)
+
+            if _has_existing_alt:
+                map_col, preview_col = st.columns(2)
+                with map_col:
+                    _do_auto_map = st.button(
+                        "AI Auto-Map (re-scan shapes)",
+                        key="auto_map_btn",
+                        help="Use AI to re-analyze chart/table data and match shapes to crosstab tables. "
+                             "Useful when table titles have changed.",
+                    )
+                with preview_col:
+                    _do_preview = st.button("Preview Matches (use existing alt text)", key="preview_matches")
+            else:
+                st.info(
+                    "No existing table connections were found in this PowerPoint. "
+                    "Use **AI Auto-Map** to automatically detect which charts and tables "
+                    "correspond to your crosstab data."
+                )
+                _do_auto_map = st.button(
+                    "AI Auto-Map Shapes to Tables",
+                    key="auto_map_btn",
+                    type="primary",
+                    help="Analyze the data inside each chart/table shape and match it "
+                         "to the crosstab tables using structural similarity and AI.",
+                )
+                _do_preview = False
+
+            # --- AI Auto-Map ---
+            if _do_auto_map:
+                prs_map = Presentation(st.session_state["_tmp_pptx"])
+                progress_bar = st.progress(0, text="Auto-mapping shapes...")
+
+                def _map_progress(pct):
+                    progress_bar.progress(min(pct, 1.0), text=f"Auto-mapping... {pct:.0%}")
+
+                map_results = auto_map_presentation_obj(
+                    prs_map, data["tables"],
+                    pptx_out=st.session_state["_tmp_pptx"],
+                    use_llm=True,
+                    write_alt=True,
+                    progress_callback=_map_progress,
+                )
+                progress_bar.progress(1.0, text="Auto-mapping complete!")
+
+                report = results_to_report(map_results)
+                st.session_state.auto_map_report = report
+                st.session_state.auto_map_applied = True
+
+                # Re-parse the updated PPTX to refresh existing_content
+                with open(st.session_state["_tmp_pptx"], "rb") as f:
+                    updated_content = parse_existing_powerpoint(f)
+                st.session_state.existing_content = updated_content
+
+                # Also generate the standard match review from the newly-tagged deck
                 prs_preview = Presentation(st.session_state["_tmp_pptx"])
                 matcher = SmartMatcher(data["tables"])
                 shapes_meta = []
@@ -1047,6 +1121,91 @@ if st.session_state.data is not None:
                 matcher.match_all(shapes_meta)
                 st.session_state.match_review = matcher.get_report()
                 st.session_state.match_overrides = {}
+
+            # --- Standard Preview Matches ---
+            if _do_preview:
+                prs_preview = Presentation(st.session_state["_tmp_pptx"])
+                matcher = SmartMatcher(data["tables"])
+                shapes_meta = []
+                for slide in prs_preview.slides:
+                    for shp in slide.shapes:
+                        alt = _parse_alt_text(shp)
+                        if alt.get("auto_update", "yes").lower() == "no":
+                            continue
+                        is_chart = False
+                        try:
+                            _ = shp.chart
+                            is_chart = True
+                        except (ValueError, AttributeError):
+                            pass
+                        if is_chart or shp.has_table:
+                            stype = "Chart" if is_chart else "Table"
+                            shapes_meta.append({"name": shp.name or "", "alt": alt, "shape_type": stype})
+                matcher.match_all(shapes_meta)
+                st.session_state.match_review = matcher.get_report()
+                st.session_state.match_overrides = {}
+                st.session_state.auto_map_report = None
+                st.session_state.auto_map_applied = False
+
+            # --- Auto-Map Report ---
+            if st.session_state.auto_map_report:
+                am_report = st.session_state.auto_map_report
+                matched = [r for r in am_report if r["table_title"]]
+                unmatched = [r for r in am_report if not r["table_title"]]
+                data_shapes = [r for r in am_report if r["shape_type"] in ("chart", "table")]
+
+                with st.expander(
+                    f"AI Auto-Map Results ({len(matched)}/{len(data_shapes)} shapes matched)",
+                    expanded=True,
+                ):
+                    if matched:
+                        st.success(
+                            f"Successfully mapped {len(matched)} shapes. "
+                            "Alt text has been written — the update pipeline will use these mappings."
+                        )
+                    if unmatched:
+                        um_data = [r for r in unmatched if r["shape_type"] in ("chart", "table")]
+                        if um_data:
+                            st.warning(f"{len(um_data)} chart/table shapes could not be matched.")
+
+                    hdr = st.columns([1, 2, 2, 1, 1, 3])
+                    hdr[0].markdown("**Type**")
+                    hdr[1].markdown("**Shape**")
+                    hdr[2].markdown("**Matched Table**")
+                    hdr[3].markdown("**Conf.**")
+                    hdr[4].markdown("**Method**")
+                    hdr[5].markdown("**Reason**")
+
+                    _METHOD_LABELS = {
+                        "structural": "Structural",
+                        "llm": "AI/LLM",
+                        "slide_context": "Slide Context",
+                        "unmatched": "—",
+                    }
+
+                    for entry in am_report:
+                        conf = entry["confidence"]
+                        method = entry["method"]
+                        if method == "unmatched":
+                            row_color = "#FADADD"
+                        elif conf >= 0.85:
+                            row_color = "#D4EDDA"
+                        elif conf >= 0.60:
+                            row_color = "#FFF3CD"
+                        else:
+                            row_color = "#FADADD"
+
+                        st.markdown(
+                            f'<div style="background:{row_color};padding:2px 6px;border-radius:4px;margin-bottom:2px;">&nbsp;</div>',
+                            unsafe_allow_html=True,
+                        )
+                        row = st.columns([1, 2, 2, 1, 1, 3])
+                        row[0].write(entry["shape_type"].capitalize())
+                        row[1].write(entry["shape_name"] or f"Slide {entry['slide_idx'] + 1}")
+                        row[2].write(entry["table_title"] or "—")
+                        row[3].write(f"{conf:.0%}" if conf else "—")
+                        row[4].write(_METHOD_LABELS.get(method, method))
+                        row[5].write(entry["reason"][:80] if entry["reason"] else "")
 
             if st.session_state.match_review:
                 report = st.session_state.match_review

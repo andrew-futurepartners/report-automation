@@ -172,6 +172,61 @@ def _get_base_n(table: Dict[str, Any], col_key: Optional[str] = None) -> Optiona
 # Chart update
 # ---------------------------------------------------------------------------
 
+def _flipped_series_from_table(
+    table: Dict[str, Any],
+    row_key: str,
+    col_keys: List[str],
+) -> Tuple[List[str], List[Optional[float]]]:
+    """Read one row's values across specific columns (for flipped-orientation charts)."""
+    row_labels = table.get("row_labels", [])
+    col_labels = table.get("col_labels", [])
+    values = table.get("values", [])
+
+    row_idx = None
+    norm_rk = _norm(row_key)
+    for i, rl in enumerate(row_labels):
+        if _norm(rl) == norm_rk:
+            row_idx = i
+            break
+
+    if row_idx is None:
+        from difflib import SequenceMatcher
+        best_ratio, best_idx = 0.0, None
+        for i, rl in enumerate(row_labels):
+            r = SequenceMatcher(None, norm_rk, _norm(rl)).ratio()
+            if r > best_ratio:
+                best_ratio, best_idx = r, i
+        if best_ratio >= 0.55:
+            row_idx = best_idx
+
+    if row_idx is None:
+        logger.warning("Flipped chart row_key '%s' not found in table", row_key)
+        return [], []
+
+    cats: List[str] = []
+    vals: List[Optional[float]] = []
+    for ck in col_keys:
+        col_idx = None
+        for ci, cl in enumerate(col_labels):
+            if cl == ck:
+                col_idx = ci
+                break
+        cats.append(ck)
+        if col_idx is not None and row_idx < len(values) and col_idx < len(values[row_idx]):
+            raw = values[row_idx][col_idx]
+            try:
+                v = float(raw) if raw is not None else None
+                if v is not None and (math.isnan(v) or math.isinf(v)):
+                    v = None
+                vals.append(v)
+            except (ValueError, TypeError):
+                vals.append(None)
+        else:
+            vals.append(None)
+
+    return cats, vals
+
+
 def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str],
                   explicit_rows: Optional[List[str]],
                   exclude_terms: Optional[List[str]] = None,
@@ -181,7 +236,23 @@ def _update_chart(shape, table: Dict[str, Any], col_key: Optional[str],
     alt = _parse_alt_text(shape)
     ex = _exclude_indices(table["row_labels"], exclude_terms)
 
-    # --- Extract data series ---
+    # --- Flipped orientation: categories = columns, series = one row ---
+    if alt.get("orientation") == "flipped":
+        row_key = alt.get("row_key", "")
+        raw_cols = alt.get("column", "")
+        flip_col_keys = [c.strip() for c in raw_cols.split(",") if c.strip()] if raw_cols else []
+        if row_key and flip_col_keys:
+            cats, vals = _flipped_series_from_table(table, row_key, flip_col_keys)
+            if cats:
+                value_fmt = detect_value_format(vals, alt)
+                patch_chart_data(chart, cats, vals, value_format=value_fmt)
+                logger.info("Updated flipped chart for table: %s (row=%s)", table.get("title"), row_key)
+                return
+        logger.warning(
+            "Flipped chart missing row_key or column keys — falling through to normal update"
+        )
+
+    # --- Normal orientation ---
     multi_series: Optional[List[tuple]] = None
     if column_keys and len(column_keys) >= 2:
         cats = None
