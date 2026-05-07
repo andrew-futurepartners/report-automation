@@ -451,7 +451,7 @@ class TestAutoMapOrchestration:
         data_results = [r for r in results if r.fingerprint.shape_type == "chart"]
         assert len(data_results) == 1
         assert data_results[0].table_title == "Brand Awareness"
-        assert data_results[0].method == "structural"
+        assert data_results[0].method == "blended"
         assert data_results[0].confidence >= 0.5
 
     def test_auto_map_matches_table(self, pptx_with_table):
@@ -639,8 +639,8 @@ class TestTrendDetection:
     def test_mixed_below_threshold(self):
         assert _is_trend_chart(["Jan 2022", "Category A", "Category B", "Category C"]) is False
 
-    def test_trend_skip_in_orchestrator(self):
-        """Trend chart should get method='trend_skip' from auto_map_presentation_obj."""
+    def test_trend_chart_unmatched_without_date_tables(self):
+        """Trend chart with no matching time-series tables should be unmatched."""
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[5])
         cd = CategoryChartData()
@@ -654,7 +654,7 @@ class TestTrendDetection:
         )
         chart_results = [r for r in results if r.fingerprint.shape_type == "chart"]
         assert len(chart_results) == 1
-        assert chart_results[0].method == "trend_skip"
+        assert chart_results[0].method == "unmatched"
         assert chart_results[0].table_title is None
 
 
@@ -831,7 +831,7 @@ class TestQCodeMatching:
         results = auto_map_presentation_obj(prs, tables, use_llm=False, write_alt=False)
         chart_results = [r for r in results if r.fingerprint.shape_type == "chart"]
         assert len(chart_results) == 1
-        assert chart_results[0].method == "structural"
+        assert chart_results[0].method == "blended"
         assert chart_results[0].table_title == "Brand Awareness"
 
 

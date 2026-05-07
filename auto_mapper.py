@@ -1031,12 +1031,39 @@ def score_fingerprint_blended(
             w_ctx = WEIGHT_SLIDE_CONTEXT
             w_series = WEIGHT_SERIES_NAME
 
-        # If no value data available, redistribute weight to other signals
-        if not first_series_vals or len(first_series_vals) < 3:
-            w_label += w_val * 0.5
-            w_ctx += w_val * 0.3
-            w_series += w_val * 0.2
+        # Cascade-redistribute weight from absent signals to active ones.
+        # A signal is "absent" when its input data is missing entirely
+        # (not just a low score — a low score is still informative).
+        has_val = bool(first_series_vals) and len(first_series_vals) >= 3
+        has_ctx = (
+            slide_ctx is not None
+            and bool(slide_ctx.q_code or slide_ctx.question_text or slide_ctx.chart_title)
+        )
+        has_series = (
+            fp.shape_type == "chart"
+            and not _is_uninformative_series(fp.series_names)
+        )
+
+        absent_weight = 0.0
+        if not has_val:
+            absent_weight += w_val
             w_val = 0.0
+        if not has_ctx:
+            absent_weight += w_ctx
+            w_ctx = 0.0
+        if not has_series:
+            absent_weight += w_series
+            w_series = 0.0
+
+        # Distribute the collected absent weight proportionally among
+        # the signals that are still active.
+        active_total = w_val + w_label + w_ctx + w_series
+        if active_total > 0 and absent_weight > 0:
+            scale = (active_total + absent_weight) / active_total
+            w_val *= scale
+            w_label *= scale
+            w_ctx *= scale
+            w_series *= scale
 
         final_score = (
             w_val * val_score
